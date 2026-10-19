@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "modconv"
 version = "0.1.0"
-description = "MLX → Core ML 模型转换工具（PyQt6 GUI）"
+description = "多目标模型转换工具（HF/ONNX/MLX/GGUF → Core ML/ONNX/MLX/GGUF，PyQt6 GUI）"
 requires-python = ">=3.10"
 dependencies = ["PyQt6>=6.6"]
 
