@@ -1,11 +1,11 @@
-# MLX2CoreML — 多目标模型转换工具
+# 多模型格式转换工具
 
 把机器学习模型在 **HF（HuggingFace）**、**ONNX**、**MLX（Apple）**、**GGUF（llama.cpp）**
 四种格式之间互相转换，并导出为可直接在 Apple 平台端侧运行的产物。图形界面（PyQt6）覆盖
 macOS / iOS / visionOS 的 **Core ML `.mlpackage`**、**ONNX**、**MLX**、**GGUF** 四类目标，
 覆盖 LLM（causal）、encoder 类（embedding / reranker）与多模态（VLM）模型。
 
-> Python 包名 / 命令行为 `modconv`，macOS 应用与仓库名为 **MLX2CoreML**。
+> Python 包名 / 命令行为 `modconv`，macOS 应用名为 **多模型格式转换工具**，仓库名为 `modconv`。
 
 ## 它解决什么
 
@@ -62,14 +62,14 @@ macOS / iOS / visionOS 的 **Core ML `.mlpackage`**、**ONNX**、**MLX**、**GGU
 
 不想折腾 Python 环境的话，用分发包：
 
-1. 从 [Releases](https://github.com/arlenecc/MLX2CoreML/releases) 或本地
-   `packaging/build_macos.py` 产物拿到 `MLX2CoreML-<版本>.dmg`，双击挂载；
-2. 把 **MLX2CoreML.app** 拖进「应用程序」；
+1. 从 [Releases](https://github.com/arlenecc/modconv/releases) 或本地
+   `packaging/build_macos.py` 产物拿到 `多模型格式转换工具-<版本>.dmg`，双击挂载；
+2. 把 **多模型格式转换工具.app** 拖进「应用程序」；
 3. 双击镜像里的 **安装依赖.command**（仅首次）：它在
-   `~/Library/Application Support/MLX2CoreML/venv` 创建独立虚拟环境并安装依赖，
+   `~/Library/Application Support/多模型格式转换工具/venv` 创建独立虚拟环境并安装依赖，
    会询问是否一并装上模型转换依赖（torch / transformers / coremltools / onnx / mlx 等，
    约 2–4 GB）；
-4. 双击 **MLX2CoreML** 启动。未签名应用若被 Gatekeeper 拦截，
+4. 双击 **多模型格式转换工具** 启动。未签名应用若被 Gatekeeper 拦截，
    在 Finder 里按住 Control 点击 App →「打开」。
 
 ### 为什么是「启动器形态」的 .app
@@ -78,19 +78,19 @@ macOS / iOS / visionOS 的 **Core ML `.mlpackage`**、**ONNX**、**MLX**、**GGU
 版本强绑定。把它们全部打进 `.app` 会得到一个数 GB 的产物，且换 Python 版本即失效。
 因此 `.app` **内嵌图标与源码**（`Contents/Resources/app`），运行时复用宿主 Python：
 优先用一键安装脚本创建的独立虚拟环境，其次用 PATH 上已装好 PyQt6 的 `python3`，
-都不可用时弹出图形提示并引导安装。日志写入 `~/Library/Logs/MLX2CoreML.log`。
+都不可用时弹出图形提示并引导安装。日志写入 `~/Library/Logs/多模型格式转换工具.log`。
 
 用环境变量可指定解释器（须已装 PyQt6）：
 
 ```bash
-MLX2COREML_PYTHON=/path/to/python3 open -a MLX2CoreML
+MODCONV_PYTHON=/path/to/python3 open -a 多模型格式转换工具
 ```
 
 ### 自行构建分发包
 
 ```bash
 python3 packaging/make_icon.py       # 生成 packaging/AppIcon.icns（需 Pillow + numpy）
-python3 packaging/build_macos.py     # 产出 dist/MLX2CoreML.app 与 dist/MLX2CoreML-<版本>.dmg
+python3 packaging/build_macos.py     # 产出 dist/多模型格式转换工具.app 与 dist/多模型格式转换工具-<版本>.dmg
 ```
 
 `build_macos.py` 会在图标缺失时自动调用 `make_icon.py`；`--skip-dmg` 可只出 `.app`。

@@ -1,12 +1,12 @@
-# MLX2CoreML 软件设计文档
+# 多模型格式转换工具 软件设计文档
 
 版本：0.2.0 ｜ 更新日期：2026-10-19
 
 把机器学习模型在 **HF / ONNX / MLX / GGUF** 四种格式之间互相转换，并导出为 Apple 平台
 可直接运行的产物（Core ML `.mlpackage`、ONNX、MLX、GGUF）。Python 包与命令行名为
-`modconv`，macOS 应用与仓库名为 **MLX2CoreML**。
+`modconv`，macOS 应用名为 **多模型格式转换工具**，仓库名为 `modconv`。
 
-> 历史命名 `MLX2CoreML` 源于最初只做「MLX → Core ML」，现已扩展为四源 × 四目标。
+> 本项目最初只做「MLX → Core ML」转换，现已扩展为四源 × 四目标。
 
 ## 1. 系统概览
 
@@ -416,25 +416,25 @@ packaging/build_macos.py    pyproject 取版本 → 组装 .app → ditto/hdiuti
 `.app` 结构（`build_macos.py` 无第三方依赖，仅用标准库 + `ditto`/`hdiutil`）：
 
 ```
-MLX2CoreML.app/Contents/
+多模型格式转换工具.app/Contents/
 ├── Info.plist                        CFBundleIconFile=AppIcon、BundleID、最低 12.0
 ├── PkgInfo
-├── MacOS/MLX2CoreML                  启动器（bash，可执行）
+├── MacOS/多模型格式转换工具                  启动器（bash，可执行）
 └── Resources/
     ├── AppIcon.icns                  图标
     ├── install_dependencies.command  一键装依赖（App 内 + DMG 根目录各一份）
     └── app/                          内嵌源码：modconv/ + pyproject.toml + README + LICENSE
 ```
 
-启动器解析顺序：`$MLX2COREML_PYTHON` → `~/Library/Application Support/MLX2CoreML/venv` → PATH 上
+启动器解析顺序：`$MODCONV_PYTHON` → `~/Library/Application Support/多模型格式转换工具/venv` → PATH 上
 已装 PyQt6 的 `python3`（3.13→3.10 依次尝试）。全部不可用时弹 `osascript` 对话框引导运行安装脚本。
 启动前把 `Contents/Resources/app` 前置到 `PYTHONPATH`，`cd "$HOME"` 后执行 `python -m modconv`，
-输出重定向到 `~/Library/Logs/MLX2CoreML.log`；非零退出码时弹错误框并 `open -R` 日志文件。
+输出重定向到 `~/Library/Logs/多模型格式转换工具.log`；非零退出码时弹错误框并 `open -R` 日志文件。
 
 安装脚本在与 App 同级、App 内两种位置都能定位源码，在独立虚拟环境里
 `pip install "<源码目录>[convert]"`（extras 可选）。
 
-DMG 内容：`MLX2CoreML.app`、`安装依赖.command`、`使用说明.txt`、`README.md`、`LICENSE` 与指向
+DMG 内容：`多模型格式转换工具.app`、`安装依赖.command`、`使用说明.txt`、`README.md`、`LICENSE` 与指向
 `/Applications` 的软链接；`hdiutil ... -fs HFS+ -format UDZO -imagekey zlib-level=9`。
 
 构建产物（`dist/`、`*.dmg`、`icon-preview-512.png`）已被 `.gitignore` 排除。

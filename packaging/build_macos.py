@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""构建 MLX2CoreML 的 macOS 分发包（.app + .dmg）。
+"""构建 多模型格式转换工具 的 macOS 分发包（.app + .dmg）。
 
 产物：
-    dist/MLX2CoreML.app            带图标的可双击应用包
-    dist/MLX2CoreML-<版本>.dmg     分发镜像（含应用、依赖安装脚本、说明与许可证）
+    dist/多模型格式转换工具.app            带图标的可双击应用包
+    dist/多模型格式转换工具-<版本>.dmg     分发镜像（含应用、依赖安装脚本、说明与许可证）
 
 为什么是"启动器形态"的 .app：
     转换功能依赖 torch / transformers / coremltools，三者合计 2–4 GB；把它们全部
     打进 .app 会得到一个数 GB、且与宿主 Python 版本强绑定的产物。因此 .app 内嵌
     源码与图标，运行时复用宿主 Python 环境（优先用一键安装脚本创建在
-    ~/Library/Application Support/MLX2CoreML/venv 下的独立虚拟环境），
+    ~/Library/Application Support/多模型格式转换工具/venv 下的独立虚拟环境），
     缺失依赖时给出图形化提示并引导安装。详见 README「分发包」一节。
 
 用法：
@@ -30,8 +30,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 DIST = ROOT / "dist"
-APP_NAME = "MLX2CoreML"
-BUNDLE_ID = "com.arlenecc.MLX2CoreML"
+APP_NAME = "多模型格式转换工具"
+BUNDLE_ID = "com.modconv.app"
 MIN_MACOS = "12.0"
 
 # 不进入分发包的目录/文件
@@ -51,7 +51,7 @@ def copy_tree(src: Path, dst: Path) -> None:
 
 
 LAUNCHER = r'''#!/bin/bash
-# MLX2CoreML 启动器：定位 Python 环境并启动 GUI。
+# 多模型格式转换工具 启动器：定位 Python 环境并启动 GUI。
 # 依赖缺失时给出图形提示，引导运行"安装依赖"脚本。
 set -u
 
@@ -59,21 +59,21 @@ APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RES_DIR="$APP_ROOT/Contents/Resources"
 SRC_DIR="$RES_DIR/app"
 INSTALLER="$RES_DIR/install_dependencies.command"
-SUPPORT_DIR="$HOME/Library/Application Support/MLX2CoreML"
-LOG_FILE="$HOME/Library/Logs/MLX2CoreML.log"
+SUPPORT_DIR="$HOME/Library/Application Support/多模型格式转换工具"
+LOG_FILE="$HOME/Library/Logs/多模型格式转换工具.log"
 
 mkdir -p "$HOME/Library/Logs" "$SUPPORT_DIR" 2>/dev/null
 
 dialog() {
     osascript -e "display dialog \"$1\" buttons {\"$2\"} default button \"$2\" \
-with title \"MLX2CoreML\" with icon ${3:-caution}" >/dev/null 2>&1
+with title \"多模型格式转换工具\" with icon ${3:-caution}" >/dev/null 2>&1
 }
 
 has_pyqt6() {
     [ -n "${1:-}" ] && [ -x "$1" ] && "$1" -c 'import PyQt6' >/dev/null 2>&1
 }
 
-PY="${MLX2COREML_PYTHON:-}"
+PY="${MODCONV_PYTHON:-}"
 
 # 1) 一键安装脚本创建的独立虚拟环境（推荐）
 if [ -z "$PY" ] && [ -x "$SUPPORT_DIR/venv/bin/python3" ]; then
@@ -89,7 +89,7 @@ if [ -z "$PY" ]; then
 fi
 
 if ! has_pyqt6 "$PY"; then
-    ANSWER="$(osascript -e 'return button returned of (display dialog "MLX2CoreML 需要先安装 Python 依赖（PyQt6 等）。\n\n点“安装依赖”会在“终端”里运行安装脚本，期间需要联网，请勿关闭终端窗口。" buttons {"退出", "安装依赖"} default button "安装依赖" with title "MLX2CoreML" with icon caution)' 2>/dev/null || echo "退出")"
+    ANSWER="$(osascript -e 'return button returned of (display dialog "多模型格式转换工具 需要先安装 Python 依赖（PyQt6 等）。\n\n点“安装依赖”会在“终端”里运行安装脚本，期间需要联网，请勿关闭终端窗口。" buttons {"退出", "安装依赖"} default button "安装依赖" with title "多模型格式转换工具" with icon caution)' 2>/dev/null || echo "退出")"
     if [ "$ANSWER" = "安装依赖" ]; then
         open -a Terminal "$INSTALLER"
     fi
@@ -103,34 +103,34 @@ cd "$HOME" || cd /
 "$PY" -m modconv >>"$LOG_FILE" 2>&1
 STATUS=$?
 if [ "$STATUS" -ne 0 ]; then
-    dialog "MLX2CoreML 启动失败（退出码 $STATUS）。\n日志已保存到：\n$LOG_FILE" "好" stop
+    dialog "多模型格式转换工具 启动失败（退出码 $STATUS）。\n日志已保存到：\n$LOG_FILE" "好" stop
     open -R "$LOG_FILE" 2>/dev/null
 fi
 '''
 
 
 INSTALLER = r'''#!/bin/bash
-# 为 MLX2CoreML 创建独立虚拟环境并安装依赖。
+# 为 多模型格式转换工具 创建独立虚拟环境并安装依赖。
 # 可在 App 包内运行，也可从 DMG 根目录双击运行。
 set -u
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SELF_DIR/../Contents/Resources/app" ]; then
     SRC_DIR="$(cd "$SELF_DIR/../Contents/Resources/app" && pwd)"
-elif [ -d "$SELF_DIR/MLX2CoreML.app/Contents/Resources/app" ]; then
-    SRC_DIR="$SELF_DIR/MLX2CoreML.app/Contents/Resources/app"
+elif [ -d "$SELF_DIR/多模型格式转换工具.app/Contents/Resources/app" ]; then
+    SRC_DIR="$SELF_DIR/多模型格式转换工具.app/Contents/Resources/app"
 elif [ -d "$SELF_DIR/../Resources/app" ]; then
     SRC_DIR="$(cd "$SELF_DIR/../Resources/app" && pwd)"
 else
-    echo "找不到 MLX2CoreML 源码目录（Contents/Resources/app）。"
-    echo "请把本脚本与 MLX2CoreML.app 放在同一目录下再运行。"
+    echo "找不到 多模型格式转换工具 源码目录（Contents/Resources/app）。"
+    echo "请把本脚本与 多模型格式转换工具.app 放在同一目录下再运行。"
     exit 1
 fi
 
-VENV="$HOME/Library/Application Support/MLX2CoreML/venv"
+VENV="$HOME/Library/Application Support/多模型格式转换工具/venv"
 PY="$(command -v python3 || true)"
 
-echo "MLX2CoreML 依赖安装"
+echo "多模型格式转换工具 依赖安装"
 echo "  源码目录: $SRC_DIR"
 echo "  虚拟环境: $VENV"
 echo
@@ -159,7 +159,7 @@ fi
 echo "==> 升级 pip"
 "$VENV/bin/python3" -m pip install --upgrade pip
 
-echo "==> 安装 MLX2CoreML$EXTRA"
+echo "==> 安装 多模型格式转换工具$EXTRA"
 "$VENV/bin/python3" -m pip install "${SRC_DIR}${EXTRA}"
 
 echo
@@ -171,24 +171,24 @@ if [ -n "$EXTRA" ]; then
 fi
 
 echo
-echo "安装完成。回到“应用程序”双击 MLX2CoreML 即可启动。"
+echo "安装完成。回到“应用程序”双击 多模型格式转换工具 即可启动。"
 read -r -p "按回车关闭本窗口。" _
 '''
 
 
-USAGE_TXT = """MLX2CoreML 安装与使用
+USAGE_TXT = """多模型格式转换工具 安装与使用
 =========================
 
-1. 把 MLX2CoreML.app 拖到左边的“应用程序”文件夹。
+1. 把 多模型格式转换工具.app 拖到左边的“应用程序”文件夹。
 
 2. 双击“安装依赖.command”（首次使用必需）
-   - 会为 MLX2CoreML 创建独立虚拟环境：
-     ~/Library/Application Support/MLX2CoreML/venv
+   - 会为 多模型格式转换工具 创建独立虚拟环境：
+     ~/Library/Application Support/多模型格式转换工具/venv
    - 询问是否安装模型转换依赖（torch / transformers / coremltools，约 2-4 GB）
      只做界面体验可以选 n；要做真实转换请选 Y。
    - 安装需要联网，请耐心等待，勿关闭终端窗口。
 
-3. 双击 MLX2CoreML 启动（若提示已损坏或来自未验证的开发者，
+3. 双击 多模型格式转换工具 启动（若提示已损坏或来自未验证的开发者，
    请在 Finder 里按住 Control 点击 App →“打开”）。
 
 分发包是“启动器形态”的 .app：内嵌图标与源码，运行时复用宿主 Python
@@ -197,11 +197,11 @@ USAGE_TXT = """MLX2CoreML 安装与使用
 
 环境变量
 --------
-MLX2COREML_PYTHON  指定启动用的 Python 解释器（须已安装 PyQt6）
+MODCONV_PYTHON  指定启动用的 Python 解释器（须已安装 PyQt6）
 
 日志
 ----
-~/Library/Logs/MLX2CoreML.log
+~/Library/Logs/多模型格式转换工具.log
 
 完整文档见 README.md。
 """
@@ -266,7 +266,7 @@ def build_app(version: str, icon: Path) -> Path:
 
 def build_dmg(app: Path, version: str) -> Path:
     dmg = DIST / f"{APP_NAME}-{version}.dmg"
-    with tempfile.TemporaryDirectory(prefix="mlx2coreml-dmg-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="modconv-dmg-") as tmp:
         stage = Path(tmp) / APP_NAME
         stage.mkdir()
         subprocess.run(["ditto", str(app), str(stage / app.name)], check=True)

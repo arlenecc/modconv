@@ -96,14 +96,14 @@ def test_launcher_resolves_python_and_sets_pythonpath(build_mod, tmp_path, monke
 
     home = tmp_path / "home"
     home.mkdir()
-    env = {**os.environ, "MLX2COREML_PYTHON": str(fake_py), "HOME": str(home)}
+    env = {**os.environ, "MODCONV_PYTHON": str(fake_py), "HOME": str(home)}
 
     proc = subprocess.run([str(app / "Contents" / "MacOS" / build_mod.APP_NAME)],
                           capture_output=True, text=True, timeout=60, env=env, cwd=str(home))
     assert proc.returncode == 0, proc.stderr
 
-    log = home / "Library" / "Logs" / "MLX2CoreML.log"
-    assert log.is_file(), "启动器应把输出写入 ~/Library/Logs/MLX2CoreML.log"
+    log = home / "Library" / "Logs" / "多模型格式转换工具.log"
+    assert log.is_file(), "启动器应把输出写入 ~/Library/Logs/多模型格式转换工具.log"
     line = log.read_text(encoding="utf-8")
     assert "LAUNCHED:modconv" in line
     assert str(app / "Contents" / "Resources" / "app") in line

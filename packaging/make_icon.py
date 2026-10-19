@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 MLX2CoreML 的 macOS 应用图标（AppIcon.icns）。
+"""生成多模型格式转换工具 的 macOS 应用图标（AppIcon.icns）。
 
 设计：圆角方形底 + 蓝紫渐变 + 居中的白色粗箭头（"转换"语义），
 外加轻微投影。渐变用 numpy 生成、箭头的圆角/抗锯齿由 PIL 处理，
