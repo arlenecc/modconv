@@ -36,9 +36,183 @@ import time
 from pathlib import Path
 
 import torch
+from typing import Optional
 from modconv.converter import ConversionHooks, ConversionResult
 from modconv.backend import resolve_sidecar_dir
 from modconv.scanner import FileInfo
+
+# protobuf 单条消息上限 2GB：超过后 onnx.save 会抛
+# "EncodeError: Failed to serialize proto"，必须改走外部数据（见 _save_onnx）。
+# 留 200MB 余量，避免估算误差导致落盘时才失败。
+_PROTOBUF_SIZE_LIMIT = (2 << 30) - (200 << 20)
+
+# TensorProto 各 dtype 的每元素字节数（用于估算模型大小，见 _onnx_initializer_bytes）
+_TENSOR_DTYPE_BYTES = {
+    1: 4,    # FLOAT
+    2: 8,    # UINT8 -> 实际 1，见下方修正
+    3: 1,    # INT8
+    4: 2,    # UINT16
+    5: 2,    # INT16
+    6: 4,    # INT32
+    7: 8,    # INT64
+    8: 1,    # STRING（按 1 估，权重不会是 string）
+    9: 1,    # BOOL
+    10: 2,   # FLOAT16
+    11: 8,   # DOUBLE
+    12: 4,   # UINT32
+    13: 8,   # UINT64
+    14: 4,   # COMPLEX64
+    15: 8,   # COMPLEX128
+    16: 2,   # BFLOAT16
+}
+_TENSOR_DTYPE_BYTES[2] = 1  # UINT8
+
+
+def _is_bf16_config(config) -> bool:
+    """配置声明的权重 dtype 是否为 bfloat16（含复合配置的 text_config）。"""
+    for src in (config, getattr(config, "text_config", None)):
+        if src is None:
+            continue
+        for attr in ("dtype", "torch_dtype"):
+            val = getattr(src, attr, None)
+            if val is not None and "bfloat16" in str(val):
+                return True
+    return False
+
+
+# 折叠权重常量链时支持的算子及其 numpy dtype（Cast 的 to 属性）
+_CAST_TO_NUMPY = {
+    1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64",
+    9: "bool", 10: "float16", 11: "float64", 12: "uint32",
+}
+
+
+def fold_const_weight_nodes(model, max_rounds: int = 3) -> int:
+    """把权重上的常量链（``Transpose`` / ``Cast``）折叠进 initializer。
+
+    与 ``fold_transposed_initializers`` 同目的，但覆盖完整链路：
+    ``initializer → Transpose → Cast → MatMul``（PyTorch 导出 nn.Linear 的常见形态）。
+    只折 Transpose 不够——中间那层 Cast 仍会让量化器判定
+    "MatMul doesn't have const weight" 而跳过（实测 Qwen3.5-2B：只折 Transpose 时
+    187 个权重里只有 102 个被量化，其余 85 个卡在 Cast 上）。
+    """
+    import numpy as np
+    from onnx import numpy_helper
+
+    total = 0
+    for _ in range(max_rounds):
+        inits = {i.name: i for i in model.graph.initializer}
+        consumers = {}
+        for node in model.graph.node:
+            for name in node.input:
+                consumers[name] = consumers.get(name, 0) + 1
+
+        folded, drop_nodes, drop_inits = [], [], set()
+        for node in model.graph.node:
+            src = node.input[0] if node.input else None
+            if src is None or src not in inits or len(node.input) != 1:
+                continue
+            try:
+                arr = numpy_helper.to_array(inits[src])
+                if node.op_type == "Transpose" and node.attribute:
+                    perm = tuple(int(v) for v in node.attribute[0].ints)
+                    out = np.ascontiguousarray(np.transpose(arr, perm))
+                elif node.op_type == "Cast":
+                    to = int(node.attribute[0].i)
+                    if to not in _CAST_TO_NUMPY:
+                        continue  # bf16 等 numpy 无直接对应的类型：保持原节点
+                    out = np.ascontiguousarray(arr.astype(_CAST_TO_NUMPY[to]))
+                else:
+                    continue
+                folded.append(numpy_helper.from_array(out, node.output[0]))
+            except Exception:
+                continue
+            drop_nodes.append(node)
+            if consumers.get(src, 0) <= 1:
+                drop_inits.add(src)
+
+        if not folded:
+            break
+        keep = [n for n in model.graph.node if n not in drop_nodes]
+        keep_i = [i for i in model.graph.initializer if i.name not in drop_inits]
+        model.graph.ClearField("node")
+        model.graph.node.extend(keep)
+        model.graph.ClearField("initializer")
+        model.graph.initializer.extend(keep_i)
+        model.graph.initializer.extend(folded)
+        total += len(folded)
+    return total
+
+
+def fold_transposed_initializers(model) -> int:
+    """把 ``Transpose(initializer)`` 折叠成 initializer，让权重量化器能识别常量权重。
+
+    ``torch.onnx.export`` 导出 ``nn.Linear`` 时产出 ``Transpose(W) → MatMul(x, Wᵀ)``。
+    本工具为保留 HF 权重名（供 ONNX→MLX 反查）而使用 ``do_constant_folding=False``，
+    于是该 Transpose 没被折叠，MatMul 的 B 输入是**动态张量**——onnxruntime 的权重
+    量化器（int4 MatMulNBits、int8 dynamic）会逐个判定
+    "MatMul doesn't have const weight" 而**跳过全部 MatMul**，产物实际仍是 fp32，
+    体积与精度都没变（实测 Qwen3.5-2B：3685 个 MatMul 全部被跳过）。
+
+    折叠后新 initializer 直接沿用原 Transpose 的输出名，消费节点无需改名；原
+    initializer 若只剩这一个消费者则一并删除（否则权重会存两份，体积翻倍）。
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper
+
+    inits = {i.name: i for i in model.graph.initializer}
+    # 统计每个 initializer 被多少个节点消费（含即将删除的 Transpose）
+    consumers = {}
+    for node in model.graph.node:
+        for name in node.input:
+            consumers[name] = consumers.get(name, 0) + 1
+
+    folded = []
+    drop_nodes = []
+    drop_inits = set()
+    for node in model.graph.node:
+        if node.op_type != "Transpose" or len(node.input) != 1:
+            continue
+        src = node.input[0]
+        if src not in inits or not node.attribute:
+            continue
+        try:
+            perm = tuple(int(v) for v in node.attribute[0].ints)
+            arr = numpy_helper.to_array(inits[src])
+            out = np.ascontiguousarray(np.transpose(arr, perm))
+            folded.append(numpy_helper.from_array(out, node.output[0]))
+        except Exception:
+            continue
+        drop_nodes.append(node)
+        if consumers.get(src, 0) <= 1:
+            drop_inits.add(src)
+
+    if not folded:
+        return 0
+    keep_nodes = [n for n in model.graph.node if n not in drop_nodes]
+    keep_inits = [i for i in model.graph.initializer if i.name not in drop_inits]
+    model.graph.ClearField("node")
+    model.graph.node.extend(keep_nodes)
+    model.graph.ClearField("initializer")
+    model.graph.initializer.extend(keep_inits)
+    model.graph.initializer.extend(folded)
+    return len(folded)
+
+
+def _onnx_initializer_bytes(model) -> int:
+    """按 initializer 的 dims×dtype 估算模型字节数。
+
+    不用 ``model.ByteSize()``：它在超过 protobuf 2GB 上限时会直接抛 EncodeError，
+    没法用来预判（实测 2B 的 Qwen3.5 就是如此）。
+    """
+    total = 0
+    for init in model.graph.initializer:
+        n = 1
+        for d in init.dims:
+            n *= int(d)
+        total += n * _TENSOR_DTYPE_BYTES.get(init.data_type, 4)
+    return total
 
 
 class HfToOnnxBackend:
@@ -50,16 +224,22 @@ class HfToOnnxBackend:
 
     _TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
                         "special_tokens_map.json", "vocab.txt",
-                        "vocab.json", "merges.txt")
+                        "vocab.json", "merges.txt",
+                        # 新版 HF 把对话模板单独放在 chat_template.jinja；多模态还需要
+                        # processor_config.json（图像预处理）。缺了它们产物不能直接用。
+                        "chat_template.jinja", "processor_config.json")
 
     def __init__(self, source: Path, output_dir: Path, *,
                  quant_mode: str = "fp16", model_kind: str = "auto",
-                 opset: int = 17):
+                 opset: int = 17, output_name: Optional[str] = None):
         self.source = Path(source).expanduser().resolve()
         self.output_dir = Path(output_dir).expanduser()
         self.quant_mode = quant_mode
         self.model_kind = model_kind
         self.opset = opset
+        # 产物文件名。MLX/GGUF→ONNX 走的是"归一化成临时 HF 目录"的路径，若按
+        # source.name 命名会得到一个临时目录名（如 modconv_mlx2hf_xxxx.onnx）。
+        self.output_name = output_name
 
     @staticmethod
     def _import_hf():
@@ -148,6 +328,15 @@ class HfToOnnxBackend:
         model.eval()
 
         fp16 = (self.quant_mode == "fp16")
+        # 源权重是 bfloat16 时**必须**转 fp16 再导出：onnxruntime 不支持 bf16 的
+        # Conv 等算子，按原 dtype 导出的图加载即失败
+        # （InvalidGraph: Type 'tensor(bfloat16)' of input parameter ... of Conv）。
+        # Qwen3.5/Qwen3 等权重默认就是 bf16，而 bf16 只在 fp16 档位下才被转走，
+        # 量化档位原本会直接导出 bf16 → 产物无法加载。
+        if _is_bf16_config(cfg):
+            hooks.on_log("检测到 bfloat16 权重，导出前转为 fp16"
+                         "（onnxruntime 不支持 bf16 算子）")
+            fp16 = True
         if fp16:
             model.half()
             if kind != "vlm":
@@ -158,20 +347,32 @@ class HfToOnnxBackend:
                            for k, v in dummies.items()}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        onnx_path = self.output_dir / f"{self.source.name}.onnx"
+        stem = self.output_name or self.source.name
+        onnx_path = self.output_dir / f"{stem}.onnx"
 
         hooks.on_log(f"正在导出 ONNX（fp16={fp16}, opset={self.opset}）…")
         dynamic_axes = {output_name: {0: "batch", 1: "seq"}}
         if kind == "vlm":
-            if fixed_seq:
-                # 定长导出（qwen3_5 等 chunk 线性注意力）：仅 batch 维动态，seq 维固定为
-                # 导出长度（chunk 顺序扫描已展开为该长度），运行时消费端右填充到该长度。
-                dynamic_axes = {output_name: {0: "batch"}}
-                for n in arg_names:
+            for n in arg_names:
+                if n == "position_ids":
+                    # M-RoPE 的 position_ids 形状是 (3, B, S)：第 0 维是 t/h/w 三个
+                    # 分量，恒为 3。若与其它输入一样把第 0 维声明成 batch 动态维，
+                    # ORT 会把它报成 (position_ids_batch, 1, S)，消费端极易误传
+                    # (B, 1, S) 而算出错误结果——故第 0 维保持静态。
+                    axes = {1: f"{n}_batch"}
+                    if not fixed_seq:
+                        axes[2] = f"{n}_seq"
+                    dynamic_axes[n] = axes
+                elif fixed_seq:
+                    # 定长导出（qwen3_5 等 chunk 线性注意力）：仅 batch 维动态，seq 维
+                    # 固定为导出长度（chunk 顺序扫描已展开为该长度），运行时消费端右
+                    # 填充到该长度。
                     dynamic_axes[n] = {0: f"{n}_batch"}
-            else:
-                for n, d in dummies.items():
-                    dynamic_axes[n] = {i: f"{n}_{i}" for i in range(getattr(d, "ndim", 0))}
+                else:
+                    dynamic_axes[n] = {i: f"{n}_{i}"
+                                       for i in range(getattr(dummies[n], "ndim", 0))}
+            if fixed_seq:
+                dynamic_axes[output_name] = {0: "batch"}
         else:
             dynamic_axes["input_ids"] = {0: "batch", 1: "seq"}
         # 仅传各模型实际需要的输入（causal/embedding/reranker 仅 input_ids；vlm 含
@@ -231,11 +432,49 @@ class HfToOnnxBackend:
         wrapper = _VlmWrap(model, arg_names)
         return model, wrapper, "logits", arg_names, dummies, fixed_seq
 
+    @staticmethod
+    def _save_onnx(model, path: Path, hooks) -> None:
+        """保存 ONNX；超过 protobuf 2GB 上限时改用外部数据。
+
+        ``onnx.save`` 默认把权重内联进单个 protobuf，而 protobuf 单条消息上限是 2GB：
+        大模型落盘会抛 ``EncodeError: Failed to serialize proto``。注意**不能**用
+        ``model.ByteSize()`` 预判——它同样会触碰该上限而直接抛异常（实测 2B 模型），
+        故按 initializer 的 dims×dtype 估算；估算偏小导致内联失败时再兜底重试。
+        """
+        import onnx
+
+        def save_external():
+            hooks.on_log("模型超过 protobuf 2GB 上限，改用外部数据保存"
+                         "（.onnx + .onnx.data）")
+            onnx.save(model, str(path), save_as_external_data=True,
+                      all_tensors_to_one_file=True,
+                      location=path.name + ".data")
+
+        if _onnx_initializer_bytes(model) > _PROTOBUF_SIZE_LIMIT:
+            save_external()
+            return
+        try:
+            onnx.save(model, str(path))
+        except Exception:
+            save_external()
+
+    def _load_for_quantization(self, onnx_path: Path, hooks):
+        """读入待量化的 ONNX 并折叠常量（见 fold_transposed_initializers）。"""
+        import onnx
+        model = onnx.load(str(onnx_path))
+        n = fold_const_weight_nodes(model)
+        if n:
+            hooks.on_log(f"已折叠 {n} 个权重常量链（Transpose/Cast），使量化器能"
+                         "识别常量权重（do_constant_folding=False 会保留这些节点）")
+        return model
+
     def _quantize_int8(self, onnx_path: Path, hooks) -> Path:
         from onnxruntime.quantization import quantize_dynamic, QuantType
         qpath = onnx_path.with_name(onnx_path.stem + "_int8.onnx")
-        quantize_dynamic(str(onnx_path), str(qpath),
-                         weight_type=QuantType.QInt8, per_channel=True)
+        model = self._load_for_quantization(onnx_path, hooks)
+        quantize_dynamic(model, str(qpath),
+                         weight_type=QuantType.QInt8, per_channel=True,
+                         use_external_data_format=True)
         hooks.on_log(f"已做 int8 动态量化: {qpath.name}")
         return qpath
 
@@ -248,31 +487,66 @@ class HfToOnnxBackend:
         """
         import onnx
         qpath = onnx_path.with_name(onnx_path.stem + "_int8.onnx")
-        model = onnx.load(str(onnx_path))
+        model = self._load_for_quantization(onnx_path, hooks)
         if any(i.data_type == onnx.TensorProto.FLOAT16 for i in model.graph.initializer):
             hooks.on_log("检测到 fp16 权重，先整体转 fp32 再做 weight-only int8")
             model = fp16_to_fp32(model)
         model = weight_only_quantize(model, per_channel=True)
-        onnx.save(model, str(qpath))
+        self._save_onnx(model, qpath, hooks)
         hooks.on_log(f"已做 weight-only int8 量化（激活保持 fp32）: {qpath.name}")
         return qpath
 
     def _quantize_int4(self, onnx_path: Path, hooks) -> Path:
-        try:
-            from onnxruntime.quantization.matmul_4bits_quantizer import (
-                MatMul4BitsQuantizer)
-        except Exception:
-            hooks.on_log("int4 量化不可用（当前 onnxruntime 未提供 MatMul4BitsQuantizer），"
-                         "回退 int8")
-            return self._quantize_int8(onnx_path, hooks)
+        """int4 权重-only 量化（MatMulNBits）。
+
+        onnxruntime 的模块名随版本变过：1.22~1.30 是
+        ``matmul_4bits_quantizer.MatMul4BitsQuantizer``，1.31 起改为
+        ``matmul_nbits_quantizer.MatMulNBitsQuantizer``（且依赖 onnx_ir）。只认旧名会
+        在较新的 onnxruntime 上"int4 不可用 → 静默回退 int8"，用户拿到的并不是 int4。
+        """
         import onnx
-        model = onnx.load(str(onnx_path))
-        quant = MatMul4BitsQuantizer(model, block_size=32,
-                                     is_weight_int4=True, accuracy_level=3)
+        quantizer = None
+        label = ""
+        try:
+            from onnxruntime.quantization.matmul_nbits_quantizer import (
+                MatMulNBitsQuantizer)
+            quantizer, label = MatMulNBitsQuantizer, "MatMulNBitsQuantizer"
+        except Exception:
+            try:
+                from onnxruntime.quantization.matmul_4bits_quantizer import (
+                    MatMul4BitsQuantizer)
+                quantizer, label = MatMul4BitsQuantizer, "MatMul4BitsQuantizer"
+            except Exception as exc:
+                hooks.on_log(
+                    f"int4 量化不可用（{exc}；onnxruntime≥1.31 需安装 onnx_ir），回退 int8")
+                return self._quantize_int8(onnx_path, hooks)
+        model = self._load_for_quantization(onnx_path, hooks)
+        try:
+            quant = quantizer(model, bits=4, block_size=32, accuracy_level=3)
+        except TypeError:
+            # 旧版签名：MatMul4BitsQuantizer(model, block_size=..., is_weight_int4=...)
+            quant = quantizer(model, block_size=32, is_weight_int4=True,
+                              accuracy_level=3)
         quant.process()
+        # onnxruntime 1.31 起 quant.model 是 ONNXModel 包装（真正的 proto 在其 .model
+        # 属性里），旧版直接是 ModelProto——两种都要兼容。
+        result = getattr(quant, "model", None)
+        model = result if isinstance(result, onnx.ModelProto) \
+            else getattr(result, "model", result)
+        if not isinstance(model, onnx.ModelProto):
+            raise RuntimeError(f"{label} 未产出有效的 ONNX 模型")
+        # 量化器对不识别的图会逐个跳过而不报错（产物仍是浮点），必须显式核对
+        ops = [n.op_type for n in model.graph.node]
+        done = sum(1 for o in ops if o == "MatMulNBits")
+        left = sum(1 for o in ops if o == "MatMul")
+        if done == 0:
+            hooks.on_log(f"[warn] 没有任何 MatMul 被量化（仍有 {left} 个 MatMul），"
+                         "产物并非 int4")
+        else:
+            hooks.on_log(f"int4 量化：{done} 个 MatMulNBits，剩余 {left} 个 MatMul")
         qpath = onnx_path.with_name(onnx_path.stem + "_int4.onnx")
-        onnx.save(quant.model, str(qpath))
-        hooks.on_log(f"已做 int4 量化: {qpath.name}")
+        self._save_onnx(model, qpath, hooks)
+        hooks.on_log(f"已用 {label} 做 int4 量化: {qpath.name}")
         return qpath
 
 
@@ -887,11 +1161,14 @@ class _NormalizedSourceBackend:
                                     files, bytes_, time.monotonic() - start)
 
         try:
+            # 产物名取自**原始源**（MLX 目录名 / GGUF 文件名），而不是归一化出来的
+            # 临时 HF 目录名——后者形如 modconv_mlx2hf_xxxx，对用户毫无意义。
+            stem = self.source.stem if self.source.is_file() else self.source.name
             with self._normalize(self.source, hooks) as hf_dir:
                 hooks.on_log(f"已归一化为 HF 目录: {hf_dir}")
                 return HfToOnnxBackend(
                     hf_dir, self.output_dir, quant_mode=self.quant_mode,
-                    model_kind=self.model_kind).run(hooks)
+                    model_kind=self.model_kind, output_name=stem).run(hooks)
         except Exception as exc:
             msg = f"{self._label}→ONNX 失败: {type(exc).__name__}: {exc}"
             try:

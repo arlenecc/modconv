@@ -54,7 +54,28 @@ _GGUF_TO_HF = {
     # Qwen3 等带 QK-Norm
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
+    # Qwen3.5（llama.cpp 的 "qwen35"）用 post_attention_norm 表示注意力后的 RMSNorm
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
 }
+
+# Qwen3.5 **线性注意力层**（GatedDeltaNet）的 GGUF 名 → HF 名。
+# 该架构是混合的：每隔 full_attention_interval 层是全注意力（走 _GGUF_TO_HF 的
+# attn_q/k/v/output），其余层是线性注意力（走本表）。因此映射必须按层类型分派，
+# 单靠张量名无法区分（见 _gguf_tensor_to_hf 的 layer_types 参数）。
+_GGUF_QWEN35_LINEAR = {
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",   # [2*key_dim + value_dim, hidden]
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",    # 输出门 z
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",    # 衰减 a
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",     # 门控 b
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_norm.weight": "linear_attn.norm.weight",          # RMSNormGated(head_v_dim)
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",      # 需 reshape 成 (C,1,K)
+}
+
+# GGUF 里写作 "qwen35"（llama.cpp 的架构名）与本工具可能写出的 model_type 均需识别
+_QWEN35_ARCHS = {"qwen35", "qwen3_5", "qwen3_5_text"}
 
 # GGUF general.architecture → HF 因果 LM 架构类名
 _GGUF_ARCH_TO_ARCH_CLASS = {
@@ -63,10 +84,10 @@ _GGUF_ARCH_TO_ARCH_CLASS = {
     "qwen2moe": "Qwen2MoeForCausalLM",
     "qwen3": "Qwen3ForCausalLM",
     "qwen3moe": "Qwen3MoeForCausalLM",
-    # Qwen3.5 系列（混合线性/全注意力 + 可选视觉塔）。GGUF arch 名以 transformers 写
-    # 入的 model_type 为准：纯文本为 qwen3_5_text，多模态为 qwen3_5。
+    # Qwen3.5 系列（混合线性/全注意力 + 可选视觉塔）。GGUF 只承载文本权重
+    # （视觉塔不进 GGUF），故一律按纯文本因果模型重建。
     "qwen3_5_text": "Qwen3_5ForCausalLM",
-    "qwen3_5": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5": "Qwen3_5ForCausalLM",
     "mistral": "MistralForCausalLM",
     "mixtral": "MixtralForCausalLM",
     "gemma": "GemmaForCausalLM",
@@ -77,6 +98,9 @@ _GGUF_ARCH_TO_ARCH_CLASS = {
 _GGUF_ARCH_TO_MODEL_TYPE = {
     "llama": "llama", "qwen2": "qwen2", "qwen3": "qwen3", "mistral": "mistral",
     "mixtral": "mixtral", "gemma": "gemma", "gemma2": "gemma2", "phi3": "phi3",
+    # llama.cpp 把 Qwen3.5 写作 "qwen35"；mlx-lm 侧只有 qwen3_5 模块（没有
+    # qwen3_5_text），故统一映射到 qwen3_5，并配纯文本的 Qwen3_5ForCausalLM。
+    "qwen35": "qwen3_5", "qwen3_5": "qwen3_5", "qwen3_5_text": "qwen3_5",
 }
 
 # MLXEmbedders model_type → HF 状态字典前缀
@@ -196,9 +220,14 @@ def _write_hf_dir(out_dir: Path, tensors: Dict[str, np.ndarray],
     (out_dir / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     if tokenizer_src is not None and tokenizer_src.is_dir():
+        # chat_template.jinja：新版 HF 把对话模板从 tokenizer_config.json 拆出来单独
+        # 存放；processor_config.json：多模态的图像预处理。少了它们，归一化出的 HF 目录
+        # 导出的 ONNX 产物无法直接对话/处理图像。
         for fname in ("tokenizer.json", "tokenizer_config.json",
                       "special_tokens_map.json", "vocab.txt",
-                      "vocab.json", "merges.txt", *extra_files):
+                      "vocab.json", "merges.txt",
+                      "chat_template.jinja", "processor_config.json",
+                      *extra_files):
             sp = tokenizer_src / fname
             if sp.is_file():
                 shutil.copy(sp, out_dir / fname)
@@ -349,22 +378,151 @@ def _gguf_field(reader, name):
         return None
 
 
-def _gguf_tensor_to_hf(reader) -> Dict[str, np.ndarray]:
+# Qwen3.5 零中心 RMSNorm（HF 的 Qwen3_5RMSNorm 算 1.0 + weight）的权重后缀，
+# 与 mlx-lm 的 sanitize 折叠名单逐条一致（mlx_lm/models/qwen3_5.py 的 norm_keys）。
+# GDN 内部的 linear_attn.norm 是 Qwen3_5RMSNormGated（两侧都不加 +1），不在此列。
+_FOLDED_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def _unfold_folded_norms(tensors: Dict[str, np.ndarray], hooks=None) -> Dict[str, np.ndarray]:
+    """把 GGUF 里折叠过的 RMSNorm 权重还原成 HF 的零中心约定（减 1.0）。
+
+    llama.cpp 的 ggml rms_norm 不加 +1，故 Qwen3.5 的 norm 权重在 GGUF 里存的是
+    **折叠后的 1+gain**（实测 blk.0.attn_norm 均值 1.10、q_norm 均值 1.42，而非
+    集中在 0 附近）。而 mlx-lm 转换 Qwen3.5 时只要 conv1d 是未消毒的 PyTorch 布局
+    就会再折叠一次 +1.0（sanitize 的 has_unsanitized_conv1d 分支）。不先减掉就会
+    得到 2+gain，归一化尺度整体翻倍 → 模型输出乱码。
+    """
+    n = 0
+    for k, v in list(tensors.items()):
+        if v.ndim == 1 and k.endswith(_FOLDED_NORM_SUFFIXES):
+            tensors[k] = (v.astype(np.float32) - 1.0).astype(np.float16)
+            n += 1
+    if n and hooks is not None:
+        hooks.on_log(f"已还原 {n} 个 Qwen3.5 RMSNorm 权重的 1+gain 折叠"
+                     "（GGUF 存折叠值，mlx-lm 转换时会再 +1）")
+    return tensors
+
+
+def _gguf_qwen35_layer_types(block_count: int, interval: int) -> list:
+    """Qwen3.5 的层类型序列：每隔 interval 层一个 full_attention。
+
+    llama.cpp 与 HF 官方配置一致（实测 GGUF 中 24 层的全注意力落在 3/7/11/15/19/23，
+    即 (i + 1) % interval == 0）。GGUF 元数据只有 full_attention_interval，不存
+    layer_types 列表，必须在这里重建——否则张量名无法按层分派。
+    """
+    interval = int(interval) if interval else 4
+    if interval <= 0:
+        interval = 4
+    return ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+            for i in range(max(0, int(block_count)))]
+
+
+def _gguf_qwen35_config(reader, arch, tensors, model_type, tied,
+                        layer_types, _int, _fval) -> dict:
+    """按 Qwen3.5（混合线性/全注意力）重建 HF/MLX 配置。
+
+    顶层 model_type 必须是 ``qwen3_5``：mlx-lm 的模型注册表里只有 qwen3_5 模块
+    （没有 qwen3_5_text），写成 qwen3_5_text 会在加载时报
+    "Model type qwen3_5_text not supported."。同时字段保持**扁平**（不套
+    text_config）——mlx-lm 的 ModelArgs.from_dict 在无 text_config 时会把整个
+    config 当 text_config 用，扁平布局可直接被 mlx-lm 消费。
+    """
+    hidden = _int("embedding_length") or int(tensors["model.embed_tokens.weight"].shape[-1])
+    n_heads = _int("attention.head_count", 8) or 8
+    head_dim = _int("attention.key_length") or (hidden // n_heads)
+    rope_dim = _int("rope.dimension_count")
+    head_v_dim = _int("ssm.state_size") or 128
+    value_dim = _int("ssm.inner_size") or hidden
+    num_v_heads = max(1, value_dim // head_v_dim)
+    num_k_heads = _int("ssm.group_count") or num_v_heads
+    # key_dim 由 in_proj_qkv 的实际宽度反推：conv_dim = 2*key_dim + value_dim
+    head_k_dim = head_v_dim
+    for k, v in tensors.items():
+        if k.endswith("linear_attn.in_proj_qkv.weight"):
+            key_dim = (int(v.shape[0]) - value_dim) // 2
+            if key_dim > 0:
+                head_k_dim = key_dim // num_k_heads
+            break
+    sections = _gguf_field(reader, f"{arch}.rope.dimension_sections")
+    if sections is not None:
+        try:
+            sections = [int(x) for x in sections if int(x) > 0] or None
+        except (TypeError, ValueError):
+            sections = None
+    rope_theta = _fval("rope.freq_base") or 10000000.0
+    partial = (rope_dim / head_dim) if rope_dim and head_dim else 0.25
+    return {
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "hidden_size": hidden,
+        "num_hidden_layers": _int("block_count") or len(layer_types),
+        "num_attention_heads": n_heads,
+        "num_key_value_heads": _int("attention.head_count_kv") or n_heads,
+        "head_dim": head_dim,
+        "intermediate_size": _int("feed_forward_length") or 4 * hidden,
+        "max_position_embeddings": _int("context_length") or 262144,
+        "vocab_size": int(tensors["model.embed_tokens.weight"].shape[0]),
+        "rms_norm_eps": _fval("attention.layer_norm_rms_epsilon") or 1e-6,
+        "layer_types": layer_types,
+        "full_attention_interval": _int("full_attention_interval") or 4,
+        "linear_conv_kernel_dim": _int("ssm.conv_kernel") or 4,
+        "linear_num_key_heads": num_k_heads,
+        "linear_num_value_heads": num_v_heads,
+        "linear_key_head_dim": head_k_dim,
+        "linear_value_head_dim": head_v_dim,
+        # Qwen3.5 的 q_proj 输出 2×（q 与输出门），由 attn_output_gate 控制
+        "attn_output_gate": True,
+        "attention_bias": False,
+        "mlp_only_layers": [],
+        "rope_parameters": {
+            "type": "default",
+            "rope_theta": rope_theta,
+            "partial_rotary_factor": partial,
+            "mrope_section": sections or [11, 11, 10],
+            "mrope_interleaved": True,
+        },
+        "tie_word_embeddings": bool(tied),
+        "torch_dtype": "float16",
+    }
+
+
+def _gguf_tensor_to_hf(reader, layer_types: Optional[list] = None) -> Dict[str, np.ndarray]:
     """读取 GGUF 全部张量 → HF 命名（fp16），量化张量自动反量化。
 
     形状约定：``GGUFWriter.add_tensor`` 原样存储传入数组的形状与行主序数据，
     Reader 的 ``tensor.shape`` 是**反转后的 ggml 序**。因此 HF 形状 =
     ``tuple(tensor.shape)[::-1]``，数据按该形状直接 reshape 即可（**不是转置**）。
+
+    ``layer_types`` 供混合注意力架构（Qwen3.5）按层类型分派：同一个 GGUF 名在
+    全注意力层映射进 ``self_attn.*``、在线性注意力层映射进 ``linear_attn.*``。
     """
     from gguf.quants import dequantize as _dq
     from gguf import quant_shape_to_byte_shape
+
+    def _map(rest: str, layer_idx: Optional[int]):
+        """(块内张量名, 层号) → HF 名；None 表示丢弃。"""
+        if layer_types is not None and layer_idx is not None and layer_idx < len(layer_types):
+            if layer_types[layer_idx] != "full_attention" and rest in _GGUF_QWEN35_LINEAR:
+                return _GGUF_QWEN35_LINEAR[rest]
+        return _GGUF_TO_HF.get(rest)
 
     out: Dict[str, np.ndarray] = {}
     for t in reader.tensors:
         name = t.name
         m = re.match(r"blk\.(\d+)\.(.+)", name)
         if m:
-            hf = f"model.layers.{int(m.group(1))}.{_GGUF_TO_HF[m.group(2)]}"
+            idx, rest = int(m.group(1)), m.group(2)
+            mapped = _map(rest, idx)
+            if mapped is None:
+                continue
+            hf = f"model.layers.{idx}.{mapped}"
         elif name in _GGUF_TO_HF:
             hf = _GGUF_TO_HF[name]
         else:
@@ -379,6 +537,10 @@ def _gguf_tensor_to_hf(reader) -> Dict[str, np.ndarray]:
         else:                             # 量化：按 byte-shape 反量化后回到 HF 形状
             bshape = quant_shape_to_byte_shape(declared, t.tensor_type)
             arr = np.asarray(_dq(raw.reshape(bshape), t.tensor_type)).reshape(declared)
+        # GDN 的 depthwise conv1d：GGUF 存 (conv_dim, kernel)，PyTorch 的
+        # nn.Conv1d(groups=C) 权重是 (C, 1, K)。缺了中间维会被当广播/形状不符。
+        if hf.endswith("linear_attn.conv1d.weight") and arr.ndim == 2:
+            arr = arr.reshape(arr.shape[0], 1, arr.shape[1])
         out[hf] = np.ascontiguousarray(arr.astype(np.float16))
     if not out:
         raise RuntimeError("GGUF 中未发现可识别的 llama 布局张量")
@@ -425,7 +587,18 @@ def gguf_to_hf_dir(source: Path, hooks, out_dir: Optional[Path] = None
         v = _gguf_field(reader, f"{arch}.{name}")
         return int(v) if isinstance(v, (int, float)) else default
 
-    tensors = _gguf_tensor_to_hf(reader)
+    def _fval(name, default=None):
+        v = _gguf_field(reader, f"{arch}.{name}")
+        return float(v) if isinstance(v, (int, float)) else default
+
+    # Qwen3.5 是混合注意力（linear_attention / full_attention 交替），必须先定出
+    # 每层的类型，张量名才能正确分派到 linear_attn.* 或 self_attn.*
+    layer_types = (_gguf_qwen35_layer_types(_int("block_count", 0) or 0,
+                                            _int("full_attention_interval", 4) or 4)
+                   if str(arch) in _QWEN35_ARCHS else None)
+    tensors = _gguf_tensor_to_hf(reader, layer_types)
+    if layer_types is not None:
+        tensors = _unfold_folded_norms(tensors, hooks)
     # 偏置自洽：目标模型结构按 model_type 构建（GGUF arch 常被写为通用 "llama"，
     # 而 Llama 的 q/k/v/o_proj 均带 bias）。缺失的偏置补零——与"无偏置"数值等价，
     # 避免 load_weights strict 报 Missing/Extra。
@@ -462,6 +635,17 @@ def gguf_to_hf_dir(source: Path, hooks, out_dir: Optional[Path] = None
     # 依据实际张量判定 bias 开关（GGUF 元数据不记录 attention_bias/mlp_bias）
     has_attn_bias = any(k.endswith("self_attn.q_proj.bias") for k in tensors)
     has_mlp_bias = any(k.endswith("mlp.gate_proj.bias") for k in tensors)
+    if layer_types is not None:
+        cfg = _gguf_qwen35_config(reader, arch, tensors, model_type, tied,
+                                  layer_types, _int, _fval)
+        for key, tid_key in (("bos_token_id", "tokenizer.ggml.bos_token_id"),
+                             ("eos_token_id", "tokenizer.ggml.eos_token_id"),
+                             ("pad_token_id", "tokenizer.ggml.padding_token_id")):
+            v = _gguf_field(reader, tid_key)
+            if isinstance(v, int):
+                cfg[key] = v
+        return _gguf_write(reader, cfg, tensors, hooks, out_dir)
+
     cfg = {
         "model_type": model_type,
         "architectures": [_GGUF_ARCH_TO_ARCH_CLASS.get(model_type, "LlamaForCausalLM")],
@@ -494,6 +678,12 @@ def gguf_to_hf_dir(source: Path, hooks, out_dir: Optional[Path] = None
         if isinstance(v, int):
             cfg[key] = v
 
+    return _gguf_write(reader, cfg, tensors, hooks, out_dir)
+
+
+def _gguf_write(reader, cfg: dict, tensors: Dict[str, np.ndarray], hooks,
+                out_dir: Optional[Path]) -> Tuple[Path, Optional[Path]]:
+    """落盘 HF 目录 + 重建 tokenizer（gguf_to_hf_dir 的公共收尾）。"""
     own = None
     if out_dir is None:
         own = Path(tempfile.mkdtemp(prefix="modconv_gguf2hf_"))
@@ -503,7 +693,7 @@ def gguf_to_hf_dir(source: Path, hooks, out_dir: Optional[Path] = None
         hooks.on_log("已由 GGUF 词表重建 tokenizer.json")
     else:
         hooks.on_log("警告：GGUF 无分词器字段，未生成 tokenizer.json")
-    hooks.on_log(f"GGUF→HF 归一化完成：{len(tensors)} 个张量（{model_type}）")
+    hooks.on_log(f"GGUF→HF 归一化完成：{len(tensors)} 个张量（{cfg['model_type']}）")
     return out_dir, own
 
 

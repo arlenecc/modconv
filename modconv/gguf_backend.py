@@ -25,9 +25,52 @@ import numpy as np
 from modconv.converter import ConversionHooks, ConversionResult
 from modconv.backend import resolve_sidecar_dir
 
-# 支持的 HF model_type → GGUF 架构（Llama 布局统一映射为 "llama"）
+# 支持的 HF model_type
 _LLAMA_LAYOUT = {"llama", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen3_5_text",
-                 "mistral", "mixtral"}
+                 "qwen3_5", "mistral", "mixtral"}
+
+# HF model_type → GGUF general.architecture。llama.cpp 把 Qwen3.5 写作 "qwen35"
+# （见实测 GGUF：general.architecture=qwen35，元数据前缀同为 qwen35.*），写成
+# qwen3_5 会让它按未知架构解析而加载失败。其余架构名与 HF model_type 一致。
+_GGUF_ARCH_NAME = {"qwen3_5": "qwen35", "qwen3_5_text": "qwen35"}
+
+# Qwen3.5 零中心 RMSNorm 的权重后缀（HF 存原始 gain，llama.cpp 的 ggml_rms_norm
+# 不加 +1，故写 GGUF 前必须折叠成 1+gain）。GDN 内的 linear_attn.norm 是
+# Qwen3_5RMSNormGated，两侧都不加 +1，不在此列。
+_FOLDED_NORM_GGUF_NAMES = (
+    "output_norm.weight",
+    ".attn_norm.weight",
+    ".post_attention_norm.weight",
+    ".attn_q_norm.weight",
+    ".attn_k_norm.weight",
+)
+
+
+def _struct_cfg(cfg: dict) -> dict:
+    """取结构字段所在的配置层。
+
+    Qwen3.5 等复合（多模态）config 把 hidden_size / num_hidden_layers / layer_types
+    等全部放在 text_config 下，顶层只有 vision 相关字段——直接读顶层会 KeyError。
+    """
+    out = dict(cfg)
+    tc = cfg.get("text_config")
+    if isinstance(tc, dict):
+        for k, v in tc.items():
+            out.setdefault(k, v)
+    return out
+
+
+def _strip_hf_prefix(name: str) -> str:
+    """去掉 HF 权重名的包装前缀，露出 layers.N.* / embed_tokens.weight 等主体。
+
+    多模态 checkpoint 把文本模型放在 model.language_model.* 之下；mlx-vlm 产物则是
+    language_model.model.*。顺序敏感：更具体的前缀先匹配。
+    """
+    for p in ("model.language_model.", "language_model.model.", "language_model.",
+              "model."):
+        if name.startswith(p):
+            return name[len(p):]
+    return name
 
 # ONNX 初始化器反归一化后，仅接受以下 HF 命名（Llama 布局），其余视为图常量丢弃
 _ONNX_ACCEPT_RE = re.compile(
@@ -51,6 +94,42 @@ class GgufBackend:
         self.quant_mode = quant_mode
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _add_qwen35_metadata(writer, scfg: dict, arch: str, hooks) -> None:
+        """写入 Qwen3.5（混合线性/全注意力）llama.cpp 必需的元数据。
+
+        键名与实测参考 GGUF（general.architecture=qwen35）逐条对齐：缺了
+        full_attention_interval / ssm.* 就无法还原混合注意力结构，缺了
+        rope.dimension_sections 则 M-RoPE 位置编码错误。
+        """
+        interval = int(scfg.get("full_attention_interval", 4) or 4)
+        writer.add_uint32(f"{arch}.full_attention_interval", interval)
+        lin_kh = int(scfg.get("linear_num_key_heads", 16) or 16)
+        lin_vh = int(scfg.get("linear_num_value_heads", 16) or 16)
+        lin_kd = int(scfg.get("linear_key_head_dim", 128) or 128)
+        lin_vd = int(scfg.get("linear_value_head_dim", 128) or 128)
+        writer.add_uint32(f"{arch}.ssm.conv_kernel",
+                          int(scfg.get("linear_conv_kernel_dim", 4) or 4))
+        writer.add_uint32(f"{arch}.ssm.inner_size", lin_vh * lin_vd)
+        writer.add_uint32(f"{arch}.ssm.state_size", lin_vd)
+        writer.add_uint32(f"{arch}.ssm.group_count", lin_kh)
+        writer.add_uint32(f"{arch}.ssm.time_step_rank", lin_vh)
+        # M-RoPE 分段：参考 GGUF 为 4 段（末段补 0），llama.cpp 按该长度读取
+        sections = None
+        rope_params = scfg.get("rope_parameters")
+        if isinstance(rope_params, dict):
+            sections = rope_params.get("mrope_section")
+        sections = sections or scfg.get("mrope_section") or [11, 11, 10]
+        try:
+            sections = [int(x) for x in sections]
+        except (TypeError, ValueError):
+            sections = [11, 11, 10]
+        sections = (sections + [0] * 4)[:4]
+        writer.add_array(f"{arch}.rope.dimension_sections", sections)
+        hooks.on_log(f"Qwen3.5 元数据：全注意力间隔 {interval}，"
+                     f"线性注意力 {lin_vh}×{lin_vd}（k {lin_kh}×{lin_kd}），"
+                     f"mrope {sections}")
+
     @staticmethod
     def _is_onnx_source(source: Path) -> bool:
         return source.is_file() and source.suffix.lower() == ".onnx"
@@ -244,14 +323,20 @@ class GgufBackend:
         from gguf import GGUFWriter
         from gguf.quants import GGMLQuantizationType, quantize as gguf_quantize
 
-        n_layers = int(cfg["num_hidden_layers"])
-        hidden = int(cfg["hidden_size"])
-        n_heads = int(cfg["num_attention_heads"])
-        n_kv = int(cfg.get("num_key_value_heads", n_heads))
-        inter = int(cfg.get("intermediate_size", 0))
-        rope_theta = float(cfg.get("rope_theta", 10000.0))
-        rms_eps = float(cfg.get("rms_norm_eps", 1e-5))
-        ctx = int(cfg.get("max_position_embeddings", 4096))
+        # 复合（多模态）config 的结构字段在 text_config 下
+        scfg = _struct_cfg(cfg)
+        n_layers = int(scfg["num_hidden_layers"])
+        hidden = int(scfg["hidden_size"])
+        n_heads = int(scfg["num_attention_heads"])
+        n_kv = int(scfg.get("num_key_value_heads", n_heads))
+        inter = int(scfg.get("intermediate_size", 0))
+        # rope_theta 在 Qwen3/3.5 上位于 rope_parameters 内（顶层没有），只读顶层会
+        # 拿到默认值 10000 而非实际的 1e7——RoPE 频率错误会让输出完全不可用。
+        _rp = scfg.get("rope_parameters")
+        _rp = _rp if isinstance(_rp, dict) else {}
+        rope_theta = float(scfg.get("rope_theta") or _rp.get("rope_theta") or 10000.0)
+        rms_eps = float(scfg.get("rms_norm_eps", 1e-5))
+        ctx = int(scfg.get("max_position_embeddings", 4096))
 
         quant_map = {"fp16": GGMLQuantizationType.F16,
                      "int8": GGMLQuantizationType.Q8_0,
@@ -262,30 +347,45 @@ class GgufBackend:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         out_name = (self.source.stem if is_onnx else self.source.name)
         out_path = self.output_dir / f"{out_name}.gguf"
-        # 架构名必须匹配源 model_type（llama/qwen2/qwen3/...），否则 llama.cpp 按错误
-        # 布局解析元数据而加载失败。
-        writer = GGUFWriter(str(out_path), mt)
+        # 架构名必须是 llama.cpp 侧的架构名（Qwen3.5 → "qwen35"），否则它按错误布局
+        # 解析元数据与张量名而加载失败。
+        gguf_arch = _GGUF_ARCH_NAME.get(mt, mt)
+        writer = GGUFWriter(str(out_path), gguf_arch)
+        is_qwen35 = gguf_arch == "qwen35"
 
         # ---- 元数据 ----
         # head_dim 优先取 config（Qwen3 等 QKV 维度可与 hidden/n_heads 不一致）
-        head_dim = int(cfg.get("head_dim", hidden // n_heads))
+        head_dim = int(scfg.get("head_dim", hidden // n_heads))
         writer.add_context_length(ctx)
         writer.add_embedding_length(hidden)
         writer.add_block_count(n_layers)
         writer.add_feed_forward_length(inter)
         writer.add_head_count(n_heads)
         writer.add_head_count_kv(n_kv)
-        writer.add_rope_dimension_count(head_dim)
+        # Qwen3.5 用**部分旋转**（partial_rotary_factor=0.25）：rope.dimension_count
+        # 是 head_dim*partial（实测参考 GGUF 为 64），而 attention.key/value_length
+        # 才是完整 head_dim（256）。
+        rope_dim = head_dim
+        if is_qwen35:
+            partial = float(scfg.get("partial_rotary_factor")
+                            or _rp.get("partial_rotary_factor") or 0.25)
+            rope_dim = int(round(head_dim * partial))
+            writer.add_uint32(f"{gguf_arch}.attention.key_length", head_dim)
+            writer.add_uint32(f"{gguf_arch}.attention.value_length", head_dim)
+        writer.add_rope_dimension_count(rope_dim)
         # Qwen3 等需要显式 attention.key_length/value_length（head_dim）
-        if hasattr(writer, "add_key_length"):
+        if hasattr(writer, "add_key_length") and not is_qwen35:
             writer.add_key_length(head_dim)
-        if hasattr(writer, "add_value_length"):
+        if hasattr(writer, "add_value_length") and not is_qwen35:
             writer.add_value_length(head_dim)
         writer.add_rope_freq_base(rope_theta)
         writer.add_layer_norm_rms_eps(rms_eps)
         writer.add_file_type(file_type)
-        if "tie_word_embeddings" in cfg:
-            writer.add_bool(f"{mt}.tie_word_embeddings", bool(cfg["tie_word_embeddings"]))
+        if "tie_word_embeddings" in scfg:
+            writer.add_bool(f"{gguf_arch}.tie_word_embeddings",
+                            bool(scfg["tie_word_embeddings"]))
+        if is_qwen35:
+            self._add_qwen35_metadata(writer, scfg, gguf_arch, hooks)
 
         # ---- 分词器 ----
         tok = self._load_tokenizer(src_dir)
@@ -315,9 +415,7 @@ class GgufBackend:
 
         # ---- 张量映射（HF/MLX/ONNX 统一：llama → GGUF llama）----
         def gname(hf_name: str) -> Optional[str]:
-            name = hf_name
-            if name.startswith("model."):
-                name = name[len("model."):]
+            name = _strip_hf_prefix(hf_name)
             repl = {
                 "embed_tokens.weight": "token_embd.weight",
                 "norm.weight": "output_norm.weight",
@@ -330,7 +428,10 @@ class GgufBackend:
                     rest = name[len(p):]
                     m = {
                         "input_layernorm.weight": "attn_norm.weight",
-                        "post_attention_layernorm.weight": "ffn_norm.weight",
+                        # Qwen3.5 用 post_attention_norm（llama.cpp 侧的名字），
+                        # 其余架构沿用 llama 的 ffn_norm
+                        "post_attention_layernorm.weight":
+                            "post_attention_norm.weight" if is_qwen35 else "ffn_norm.weight",
                         "self_attn.q_proj.weight": "attn_q.weight",
                         "self_attn.k_proj.weight": "attn_k.weight",
                         "self_attn.v_proj.weight": "attn_v.weight",
@@ -350,6 +451,19 @@ class GgufBackend:
                         "mlp.up_proj.bias": "ffn_up.bias",
                         "mlp.down_proj.bias": "ffn_down.bias",
                     }
+                    if is_qwen35:
+                        # Qwen3.5 线性注意力层（GatedDeltaNet）的 HF 名 → llama.cpp 名
+                        m.update({
+                            "linear_attn.in_proj_qkv.weight": "attn_qkv.weight",
+                            "linear_attn.in_proj_z.weight": "attn_gate.weight",
+                            "linear_attn.in_proj_a.weight": "ssm_alpha.weight",
+                            "linear_attn.in_proj_b.weight": "ssm_beta.weight",
+                            "linear_attn.out_proj.weight": "ssm_out.weight",
+                            "linear_attn.conv1d.weight": "ssm_conv1d.weight",
+                            "linear_attn.A_log": "ssm_a",
+                            "linear_attn.dt_bias": "ssm_dt.bias",
+                            "linear_attn.norm.weight": "ssm_norm.weight",
+                        })
                     if rest in m:
                         return f"blk.{i}.{m[rest]}"
             return None  # 未识别的权重丢弃
@@ -360,8 +474,25 @@ class GgufBackend:
                 mapped["output.weight"] = arr
                 continue
             gg = gname(hf_name)
-            if gg is not None:
-                mapped[gg] = arr
+            if gg is None:
+                continue
+            # GDN 的 depthwise conv1d：HF 是 (C, 1, K)，GGUF/ggml 存 (C, K)
+            if gg.endswith("ssm_conv1d.weight") and arr.ndim == 3:
+                arr = np.ascontiguousarray(arr.reshape(arr.shape[0], arr.shape[2]))
+            mapped[gg] = arr
+        if is_qwen35:
+            # HF 的零中心 RMSNorm 存原始 gain，llama.cpp 的 ggml_rms_norm 不加 +1，
+            # 故写 GGUF 前折叠成 1+gain（与 GGUF→MLX 时的还原互为逆操作）。
+            n = 0
+            for k, v in list(mapped.items()):
+                if v.ndim != 1:
+                    continue
+                hit = (k == _FOLDED_NORM_GGUF_NAMES[0]
+                       or k.endswith(_FOLDED_NORM_GGUF_NAMES[1:]))
+                if hit:
+                    mapped[k] = (v.astype(np.float32) + 1.0).astype(np.float16)
+                    n += 1
+            hooks.on_log(f"已折叠 {n} 个 Qwen3.5 RMSNorm 权重为 1+gain")
         # 权重绑定：无 lm_head 时用 token_embd 作为 output
         if "output.weight" not in mapped and "token_embd.weight" in mapped:
             mapped["output.weight"] = mapped["token_embd.weight"]

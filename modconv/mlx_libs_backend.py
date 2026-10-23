@@ -29,6 +29,16 @@ _CAUSAL_TYPES = {"llama", "mistral", "mixtral", "qwen2", "qwen2moe", "qwen3", "q
 _VLM_TYPES = {"qwen2_vl", "qwen2_5_vl", "qwen2vl", "llava", "llava_next", "idefics",
               "idefics2", "idefics3", "paligemma", "molmo", "mllama", "pixtral"}
 
+# 转换完成后需要从源目录还原/补齐的 tokenizer、processor 侧车文件。
+# 见 _restore_tokenizer_files：转换库会用 transformers 重新序列化
+# tokenizer_config.json，把 tokenizer_class 改写成模型专属类。
+_SIDECAR_FILES = (
+    "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+    "added_tokens.json", "chat_template.jinja", "vocab.json", "vocab.txt",
+    "merges.txt", "processor_config.json", "preprocessor_config.json",
+    "video_preprocessor_config.json",
+)
+
 
 class HfToMlxBackend:
     """把 HF 模型转换为 MLX 格式，可选 int4/int8 量化。
@@ -70,10 +80,72 @@ class HfToMlxBackend:
         # embedding / reranker（encoder，默认）：mlx_embeddings 仅提供 .convert 模块
         return "mlx_embeddings", "mlx_embeddings.convert", []
 
+    # ------------------------------------------------------------------
+    def _restore_tokenizer_files(self, hooks) -> None:
+        """用源目录的 tokenizer 配置修正转换库重写后的产物（关键，否则模型加载不了）。
+
+        mlx-lm / mlx-vlm 的 `convert` 会经 transformers 重新序列化
+        tokenizer_config.json，带来两处破坏：
+          1. tokenizer_class 被写成**模型专属类**（Qwen3.5 → `Qwen3_5Tokenizer`），
+             而 mlx-swift-lm 只接受 `TokenizersBackend` 等少数几种，加载时直接抛
+             "The tokenizer type 'Qwen3_5Tokenizer' is not supported."——产物等于
+             不可用（Qwen3.5-2B 实测：改回 TokenizersBackend 后立刻正常生成）；
+          2. chat_template 与 added_tokens_decoder 被丢掉，靠 chat_template 构造
+             提示词的消费端会退化成裸文本输入。
+        源目录的 HF 原版配置才是 mlx-swift-lm / mlx-lm 期望的形式，故以它为准；
+        库产物里源目录没有的键（backend / is_local 等运行期字段）保留。
+        """
+        src = self.source if self.source.is_dir() else self.source.parent
+        out_cfg = self.output_dir / "tokenizer_config.json"
+        src_cfg = src / "tokenizer_config.json"
+        if src_cfg.is_file() and out_cfg.is_file():
+            try:
+                generated = json.loads(out_cfg.read_text(encoding="utf-8"))
+                original = json.loads(src_cfg.read_text(encoding="utf-8"))
+                if isinstance(generated, dict) and isinstance(original, dict):
+                    # 源目录优先；库产物独有的键（运行期字段）补齐保留
+                    merged = {**generated, **original}
+                    out_cfg.write_text(
+                        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if generated.get("tokenizer_class") != original.get("tokenizer_class"):
+                        hooks.on_log(
+                            f"已还原 tokenizer_class: {generated.get('tokenizer_class')} → "
+                            f"{original.get('tokenizer_class')}"
+                            "（转换库重写为模型专属类，mlx-swift-lm 会拒绝加载）")
+            except (OSError, ValueError) as exc:
+                hooks.on_log(f"[warn] 还原 tokenizer_config.json 失败: {exc}")
+        elif src_cfg.is_file():
+            shutil.copy(src_cfg, out_cfg)
+        # 转换库没带过来的其余 tokenizer / processor 侧车文件，按需补齐
+        copied = []
+        for name in _SIDECAR_FILES:
+            sp, dp = src / name, self.output_dir / name
+            if sp.is_file() and not dp.exists():
+                shutil.copy(sp, dp)
+                copied.append(name)
+        if copied:
+            hooks.on_log(f"已补齐 {len(copied)} 个 tokenizer/processor 文件: "
+                         + ", ".join(copied))
+
+    @staticmethod
+    def _cfg_dims(cfg: dict) -> tuple:
+        """取 (hidden_size, intermediate_size)。
+
+        多模态的复合配置（Qwen3.5 / Qwen3-VL 等）把结构字段放在 text_config 下，
+        顶层只有 vision/audio 相关字段——直接读顶层会全部取到 0，group_size 就退化成
+        默认值，恰好能整除时看不出问题，不能整除时才会随机挑错。
+        """
+        text_cfg = cfg.get("text_config")
+        for src in (cfg, text_cfg if isinstance(text_cfg, dict) else {}):
+            hidden = int(src.get("hidden_size") or src.get("d_model") or 0)
+            inter = int(src.get("intermediate_size") or src.get("ffn_dim") or 0)
+            if hidden or inter:
+                return hidden, inter
+        return 0, 0
+
     def _effective_group(self, cfg: dict) -> int:
         """按 hidden/intermediate 维度选能整除的量化 group_size（默认尽量 64）。"""
-        hidden = int(cfg.get("hidden_size") or cfg.get("d_model") or 0)
-        inter = int(cfg.get("intermediate_size") or cfg.get("ffn_dim") or 0)
+        hidden, inter = self._cfg_dims(cfg)
         for g in (64, 32, 16, 8):
             if (not hidden or hidden % g == 0) and (not inter or inter % g == 0):
                 return g
@@ -85,10 +157,9 @@ class HfToMlxBackend:
                "--dtype", self.dtype]
         if self.quant_mode in ("int4", "int8"):
             bits = "8" if self.quant_mode == "int8" else "4"
-            cmd += ["-q", "--q-bits", bits]
-            # mlx_vlm convert 的量化参数较少，只传 q-bits
-            if lib_pkg != "mlx_vlm":
-                cmd += ["--q-group-size", str(self.group_size)]
+            # mlx_vlm convert 同样接受 --q-group-size：不传就退回库自身的默认值，
+            # 与界面上选的档位（_effective_group 按维度收敛的结果）不一致。
+            cmd += ["-q", "--q-bits", bits, "--q-group-size", str(self.group_size)]
         return cmd
 
     # ------------------------------------------------------------------
@@ -139,6 +210,11 @@ class HfToMlxBackend:
                 p.suffix in (".safetensors", ".npz") for p in self.output_dir.glob("*"))
             if not has_weights:
                 return finish(False, False, "转换结束但未找到 MLX 权重文件")
+
+            # 转换库会重写 tokenizer_config.json，必须还原（否则 mlx-swift-lm 加载失败）
+            self._restore_tokenizer_files(hooks)
+            if not (self.output_dir / "tokenizer.json").is_file():
+                hooks.on_log("[warn] 产物缺少 tokenizer.json，可能无法直接推理")
 
             total = sum(p.stat().st_size for p in self.output_dir.glob("*"))
             msg = f"HF→MLX 完成: {lib_pkg}（{self.quant_mode}）"
