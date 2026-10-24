@@ -184,6 +184,13 @@ class MlxToMlxBackend:
         if (self.source / "adapters").is_dir():
             shutil.copytree(self.source / "adapters", self.output_dir / "adapters",
                             dirs_exist_ok=True)
+        # sentence-transformers 的池化配置在 <N>_Pooling/ 子目录里（nomic 为 1_Pooling/
+        # 的 mean pooling）。MLXEmbedders/Swift 侧会读它决定池化方式，丢了可能退化成
+        # 默认池化而改变嵌入语义，故一并拷贝。
+        for sub in sorted(self.source.glob("*_Pooling")):
+            if sub.is_dir():
+                shutil.copytree(sub, self.output_dir / sub.name, dirs_exist_ok=True)
+                hooks.on_log(f"已拷贝池化配置目录: {sub.name}")
         if copied:
             hooks.on_log(f"已拷贝 {copied} 个 tokenizer 文件")
 
