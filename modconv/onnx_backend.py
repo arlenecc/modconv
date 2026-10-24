@@ -386,6 +386,10 @@ class HfToOnnxBackend:
                 dynamic_axes=dynamic_axes, opset_version=self.opset,
                 do_constant_folding=False)
 
+        # 大模型会被 torch 拆成"每个张量一个文件"（几百个散文件），统一合并成
+        # <name>.onnx + <name>.onnx.data 两个文件，避免产物目录散乱。
+        self._consolidate_external_data(onnx_path, hooks)
+
         if self.quant_mode == "int8":
             onnx_path = (self._quantize_int8_weight_only(onnx_path, hooks)
                          if kind in ("embedding", "reranker")
@@ -457,6 +461,72 @@ class HfToOnnxBackend:
             onnx.save(model, str(path))
         except Exception:
             save_external()
+
+    @staticmethod
+    def _consolidate_external_data(onnx_path: Path, hooks) -> None:
+        """把 torch 导出的"每个张量一个文件"外部数据合并为单个 ``.onnx.data``。
+
+        ``torch.onnx.export`` 对超过 protobuf 2GB 的模型默认把每个 initializer 写成
+        独立文件、文件名即张量名（2B 模型实测 404 个），产物目录非常散乱且容易漏拷。
+        ONNX 只规定"超限必须外部化"，并不要求一个张量一个文件，故导出后统一合并为
+        ``<name>.onnx`` + ``<name>.onnx.data`` 两个文件。
+
+        代价是要把模型整体读进内存一次（大模型约等于一份权重），失败时保留原分散
+        布局并告警，不会让转换失败。
+        """
+        import onnx
+
+        def _locations(model):
+            """图里所有外部数据文件的相对路径名（initializer 与 Constant 属性）。"""
+            names = set()
+            for init in model.graph.initializer:
+                if init.data_location == onnx.TensorProto.EXTERNAL:
+                    names |= _external_location(init)
+            for node in model.graph.node:
+                if node.op_type != "Constant":
+                    continue
+                for attr in node.attribute:
+                    if attr.t.data_location == onnx.TensorProto.EXTERNAL:
+                        names |= _external_location(attr.t)
+            return {n for n in names if n}
+
+        def _external_location(tensor):
+            out = set()
+            for entry in tensor.external_data:
+                if entry.key != "location":
+                    continue
+                val = entry.value
+                out.add(val.decode() if isinstance(val, bytes) else str(val))
+            return out
+
+        skeleton = onnx.load(str(onnx_path), load_external_data=False)
+        old = _locations(skeleton)
+        if not old:
+            return  # 本来就内联在单个 .onnx 里
+        del skeleton
+        hooks.on_log(f"合并 {len(old)} 个外部权重文件为单个 .onnx.data"
+                     "（需把模型读入内存一次，大模型较慢）…")
+        location = onnx_path.name + ".data"
+        try:
+            full = onnx.load(str(onnx_path))   # 读回全部外部数据
+            onnx.save(full, str(onnx_path), save_as_external_data=True,
+                      all_tensors_to_one_file=True, location=location,
+                      convert_attribute=True)
+            del full
+        except Exception as exc:
+            hooks.on_log(f"[warn] 合并外部数据失败，保留原分散布局: {exc}")
+            return
+        removed = 0
+        for name in old:
+            try:
+                p = onnx_path.parent / name
+                if p.is_file():
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        hooks.on_log(f"已合并外部权重：{onnx_path.name} + {location}"
+                     f"（删除 {removed} 个散文件）")
 
     def _load_for_quantization(self, onnx_path: Path, hooks):
         """读入待量化的 ONNX 并折叠常量（见 fold_transposed_initializers）。"""
