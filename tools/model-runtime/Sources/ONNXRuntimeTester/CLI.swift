@@ -39,6 +39,43 @@ enum CLI {
         let testCount = Int(value(for: "--count") ?? "128") ?? 128
         let maxLength = Int(value(for: "--max-length") ?? "128") ?? 128
         let cpuOnly = arguments.contains("--cpu-only")
+
+        // 通用「导出嵌入」模式：读取文本文件（JSON 数组），对指定 embedding 模型推理并输出向量
+        if let dumpPath = value(for: "--embed-file"),
+            let textsPath = value(for: "--texts-file"),
+            let emb = value(for: "--embedding"), !emb.isEmpty
+        {
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    let data = try Data(contentsOf: URL(fileURLWithPath: textsPath))
+                    let texts = try JSONDecoder().decode([String].self, from: data)
+                    let runtime = try await MLXModelRuntime.load(
+                        directory: URL(fileURLWithPath: emb), kind: .embedding)
+                    let (vectors, tokens) = try await runtime.embed(
+                        texts: texts, maxLength: maxLength)
+                    let out: [String: Any] = [
+                        "vectors": vectors,
+                        "tokens": tokens,
+                        "dim": vectors.first?.count ?? 0,
+                        "count": vectors.count,
+                    ]
+                    let json = try JSONSerialization.data(
+                        withJSONObject: out, options: [.withoutEscapingSlashes])
+                    try json.write(to: URL(fileURLWithPath: dumpPath))
+                    print(
+                        "✅ 已导出 \(vectors.count) 条向量（维度 \(vectors.first?.count ?? 0)，\(tokens) tokens）→ \(dumpPath)"
+                    )
+                } catch {
+                    print("❌ 导出失败：\(error.localizedDescription)")
+                    exit(1)
+                }
+                exit(0)
+            }
+            done.wait()
+            exit(0)
+        }
+
         let coreML = CoreMLOptions(
             // --cpu-only 与界面「仅使用 CPU」语义一致：彻底关闭 CoreML EP（而非仅 useCPUOnly），
             // 否则仍会挂上 CoreML EP，遇到不兼容的算子（如 nomic 的 rotary embedding）照样失败。

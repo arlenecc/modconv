@@ -31,3 +31,5 @@ packaging/icon-preview-512.png
 
 # SwiftPM 构建产物（examples/swift-gui 等，体积极大，不入库；Package.resolved 除外）
 .build/
+# 打包生成的 .app（由 build-app.sh 生成，体积极大，不入库）
+tools/model-runtime/ONNXRuntimeTester.app/

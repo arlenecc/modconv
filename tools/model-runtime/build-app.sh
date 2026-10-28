@@ -2,7 +2,7 @@
 # 将 ONNXRuntimeTester 打包为可双击运行的 macOS .app
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
 
 echo "🔨 正在编译 Release 版本 …"
 swift build -c release
