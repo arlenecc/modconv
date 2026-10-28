@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXEmbedders
+import MLXNN
 import MLXRerankers
 import MLXLMCommon
 import MLXHuggingFace
@@ -31,6 +32,15 @@ final class MLXModelRuntime: @unchecked Sendable {
     }
     private let jina: JinaContext?
 
+    /// jina-embeddings-v3 专用：unified 任务模型（XLM-RoBERTa + RoPE + task LoRA）。
+    /// 库的 EmbedderModelFactory 无 jina-v3 架构，走自管加载（loadWeights）+ 自管池化。
+    private struct JinaV3Context {
+        let model: JinaV3Model
+        let tokenizer: any MLXLMCommon.Tokenizer
+        let taskId: Int
+    }
+    private let jinaV3: JinaV3Context?
+
     private init(
         kind: ModelKind,
         name: String,
@@ -40,7 +50,8 @@ final class MLXModelRuntime: @unchecked Sendable {
         modelType: String,
         embeddingContainer: EmbedderModelContainer?,
         rerankerContainer: RerankerContainer?,
-        jina: JinaContext? = nil
+        jina: JinaContext? = nil,
+        jinaV3: JinaV3Context? = nil
     ) {
         self.kind = kind
         self.name = name
@@ -51,18 +62,25 @@ final class MLXModelRuntime: @unchecked Sendable {
         self.embeddingContainer = embeddingContainer
         self.rerankerContainer = rerankerContainer
         self.jina = jina
+        self.jinaV3 = jinaV3
     }
 
     /// 加载 MLX 模型：embedding 用 EmbedderModelFactory，reranker 用 RerankerModelFactory。
     /// 两者都从本地目录加载（目录需包含 config.json、权重与 tokenizer 文件）。
-    /// jina_bert（JinaBERT v2，ALiBi + GEGLU）不在库的内置注册表中，走专用分支。
-    static func load(directory: URL, kind: ModelKind) async throws -> MLXModelRuntime {
+    /// jina_bert（JinaBERT v2，ALiBi + GEGLU）与 jina-embeddings-v3（unified 任务模型，
+    /// XLM-RoBERTa + RoPE + task LoRA）都不在库的内置注册表中，走专用分支。
+    /// - Parameter task: 仅对 jina-embeddings-v3 生效，指定 LoRA 任务分支
+    ///   （retrieval.query=0 / retrieval.passage=1 / separation=2 / classification=3 / text-matching=4），
+    ///   默认 retrieval.passage。
+    static func load(directory: URL, kind: ModelKind, task: String? = nil) async throws
+        -> MLXModelRuntime
+    {
         let start = ContinuousClock.now
         let loader = #huggingFaceTokenizerLoader()
 
-        let modelType = (try? Data(contentsOf: directory.appendingPathComponent("config.json")))
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["model_type"]
-            as? String ?? ""
+        let configObj = (try? Data(contentsOf: directory.appendingPathComponent("config.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        let modelType = configObj["model_type"] as? String ?? ""
 
         let (embeddingContainer, rerankerContainer): (EmbedderModelContainer?, RerankerContainer?)
         do {
@@ -85,6 +103,12 @@ final class MLXModelRuntime: @unchecked Sendable {
                     modelDirectory: directory, modelType: modelType,
                     embeddingContainer: nil, rerankerContainer: nil,
                     jina: JinaContext(model: model, tokenizer: tokenizer))
+            }
+
+            if kind == .embedding, modelType == "jina-v3-mlx" {
+                return try await loadJinaV3(
+                    directory: directory, configObj: configObj, task: task,
+                    loader: loader, start: start)
             }
 
             if kind == .embedding {
@@ -116,8 +140,75 @@ final class MLXModelRuntime: @unchecked Sendable {
         )
     }
 
+    /// jina-embeddings-v3 加载：权重文件为 weights.safetensors。invFreq 与任务 LoRA
+    /// 不进入 update 的参数树（原始 MLXArray 经 propertyWrapper 不会被收集为参数），
+    /// 因此手动加载：剥离这两类键后走 sanitize/quantize/update，最后 loadExtra 挂载。
+    /// 池化（均值 + L2）自管。
+    private static func loadJinaV3(
+        directory: URL, configObj: [String: Any], task: String?,
+        loader: any MLXLMCommon.TokenizerLoader, start: ContinuousClock.Instant
+    ) async throws -> MLXModelRuntime {
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let config = try JinaV3Configuration(data: configData)
+        let model = JinaV3Model(config)
+
+        let rawWeights = try MLX.loadArrays(
+            url: directory.appendingPathComponent("weights.safetensors"))
+
+        // 结构化权重 = 全量权重去掉 invFreq / lora_*（这些由 loadExtra 单独挂载）
+        var structural = rawWeights
+        for key in rawWeights.keys
+        where key.hasSuffix(".invFreq") || key.contains(".lora_") || key.hasPrefix("lora_") {
+            structural.removeValue(forKey: key)
+        }
+
+        var sanitized = model.sanitize(weights: structural, metadata: [:])
+        if let q = configObj["quantization"] as? [String: Any],
+            let bits = q["bits"] as? Int, let gs = q["group_size"] as? Int
+        {
+            // 混合精度（如 v3 int4：mixer 层 8bit、其余 4bit）
+            let mixed = q["mixed"] as? [String: Any]
+            let mixedBits = mixed?["bits"] as? Int
+            let patterns = (mixed?["patterns"] as? [String]) ?? []
+            quantize(model: model) { path, _ in
+                guard sanitized["\(path).scales"] != nil else { return nil }
+                if let mb = mixedBits, !patterns.isEmpty,
+                    patterns.contains(where: { path.contains($0) })
+                {
+                    return (gs, mb, .affine)
+                }
+                return (gs, bits, .affine)
+            }
+        }
+        try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+        model.loadExtra(weights: rawWeights)
+
+        let tokenizer = try await loader.load(from: directory)
+        let elapsed = start.duration(to: .now)
+        let loadDuration = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
+        return MLXModelRuntime(
+            kind: .embedding, name: directory.lastPathComponent,
+            loadDuration: loadDuration, fileBytes: modelFileBytes(directory),
+            modelDirectory: directory, modelType: "jina-v3-mlx",
+            embeddingContainer: nil, rerankerContainer: nil,
+            jinaV3: JinaV3Context(
+                model: model, tokenizer: tokenizer, taskId: jinaV3TaskId(from: task)))
+    }
+
+    private static func jinaV3TaskId(from task: String?) -> Int {
+        switch task?.lowercased() {
+        case "retrieval.query": return 0
+        case "retrieval.passage": return 1
+        case "separation": return 2
+        case "classification": return 3
+        case "text-matching": return 4
+        default: return 1  // 默认 retrieval.passage
+        }
+    }
+
     var info: LoadedModel {
-        let isEmbedding = embeddingContainer != nil || jina != nil
+        let isEmbedding = embeddingContainer != nil || jina != nil || jinaV3 != nil
         return LoadedModel(
             kind: kind,
             backend: .mlx,
@@ -150,16 +241,19 @@ extension MLXModelRuntime: ModelRuntime {
     var backend: BackendKind { .mlx }
     var statusDescription: String { "MLX" }
     var inputNames: [String] {
-        (embeddingContainer != nil || jina != nil)
+        (embeddingContainer != nil || jina != nil || jinaV3 != nil)
             ? ["input_ids", "attention_mask", "token_type_ids"] : []
     }
     var outputNames: [String] {
-        (embeddingContainer != nil || jina != nil) ? ["pooled_output"] : ["logits"]
+        (embeddingContainer != nil || jina != nil || jinaV3 != nil) ? ["pooled_output"] : ["logits"]
     }
 
     func embed(texts: [String], maxLength: Int) async throws -> (vectors: [[Float]], tokens: Int) {
         if let jina {
             return try jinaEmbed(jina, texts: texts, maxLength: maxLength)
+        }
+        if let jinaV3 {
+            return try jinaV3Embed(jinaV3, texts: texts, maxLength: maxLength)
         }
         guard let container = embeddingContainer else {
             throw MLXRuntimeError.unsupported("该 MLX 模型不是 embedding 模型")
@@ -227,6 +321,51 @@ extension MLXModelRuntime: ModelRuntime {
         let mask = MLXArray(maskFlat).reshaped([batch, seq])
 
         let hidden = jina.model(ids, attentionMask: mask)
+        let m = mask.asType(.float32)  // [B, S]
+        let counts = MLX.maximum(m.sum(axis: -1, keepDims: true), MLXArray(Float(1e-9)))  // [B,1]
+        var pooled = (hidden.asType(.float32) * m.expandedDimensions(axes: [-1])).sum(axis: 1) / counts
+        let norm = MLX.sqrt((pooled * pooled).sum(axis: -1, keepDims: true))
+        pooled = pooled / MLX.maximum(norm, MLXArray(Float(1e-12)))
+        MLX.eval(pooled)
+
+        let hiddenDim = pooled.dim(-1)
+        var result: [[Float]] = []
+        for b in 0..<batch {
+            let row = pooled[b].asArray(Float.self)
+            precondition(row.count == hiddenDim, "embedding 维度异常")
+            result.append(row)
+        }
+        let tokenCount = trimmed.reduce(0) { $0 + $1.count }
+        return (result, tokenCount)
+    }
+
+    /// jina-embeddings-v3：非填充 token 均值池化 + L2 归一化（task LoRA 已在模型前向中叠加）
+    private func jinaV3Embed(
+        _ jinaV3: JinaV3Context, texts: [String], maxLength: Int
+    ) throws -> (vectors: [[Float]], tokens: Int) {
+        let encoded = texts.map { jinaV3.tokenizer.encode(text: $0, addSpecialTokens: true) }
+        let trimmed = encoded.map { Array($0.prefix(maxLength)) }
+        let seq = max(1, trimmed.map { $0.count }.max() ?? 1)
+        let batch = trimmed.count
+        var idFlat: [Int32] = []
+        var maskFlat: [Float] = []
+        for e in trimmed {
+            for i in 0..<seq {
+                if i < e.count {
+                    idFlat.append(Int32(e[i]))
+                    maskFlat.append(1)
+                } else {
+                    idFlat.append(0)
+                    maskFlat.append(0)
+                }
+            }
+        }
+        let ids = MLXArray(idFlat).reshaped([batch, seq])
+        let mask = MLXArray(maskFlat).reshaped([batch, seq])
+        let types = MLXArray([Int32](repeating: 0, count: batch * seq)).reshaped([batch, seq])
+
+        let hidden = jinaV3.model(
+            ids, attentionMask: mask, tokenTypeIds: types, taskId: jinaV3.taskId)
         let m = mask.asType(.float32)  // [B, S]
         let counts = MLX.maximum(m.sum(axis: -1, keepDims: true), MLXArray(Float(1e-9)))  // [B,1]
         var pooled = (hidden.asType(.float32) * m.expandedDimensions(axes: [-1])).sum(axis: 1) / counts

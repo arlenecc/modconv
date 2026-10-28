@@ -4,7 +4,8 @@ import OnnxRuntimeBindings
 /// 无界面基准测试模式，用于快速测量 Embedding / Reranker 模型速度：
 ///
 ///     swift run ONNXRuntimeTester --embedding <模型.onnx> --reranker <模型.onnx> \
-///         [--batch 16] [--count 128] [--max-length 128] [--no-coreml] [--cpu-only]
+///         [--batch 16] [--count 128] [--max-length 128] [--no-coreml] [--cpu-only] \
+///         [--task retrieval.passage]（仅 jina-embeddings-v3：retrieval.query/passage/separation/classification/text-matching）
 ///
 /// 流程与 GUI 完全一致：通过 onnxruntime-swift 加载模型（默认开启 CoreML
 /// 执行提供程序），生成一批测试数据，测量推理速度并输出统计。
@@ -39,6 +40,9 @@ enum CLI {
         let testCount = Int(value(for: "--count") ?? "128") ?? 128
         let maxLength = Int(value(for: "--max-length") ?? "128") ?? 128
         let cpuOnly = arguments.contains("--cpu-only")
+        // 仅对 jina-embeddings-v3 生效：LoRA 任务分支（retrieval.query / retrieval.passage /
+        // separation / classification / text-matching），默认 retrieval.passage
+        let taskFlag = value(for: "--task")
 
         // 通用「导出嵌入」模式：读取文本文件（JSON 数组），对指定 embedding 模型推理并输出向量
         if let dumpPath = value(for: "--embed-file"),
@@ -50,10 +54,39 @@ enum CLI {
                 do {
                     let data = try Data(contentsOf: URL(fileURLWithPath: textsPath))
                     let texts = try JSONDecoder().decode([String].self, from: data)
-                    let runtime = try await MLXModelRuntime.load(
-                        directory: URL(fileURLWithPath: emb), kind: .embedding)
-                    let (vectors, tokens) = try await runtime.embed(
-                        texts: texts, maxLength: maxLength)
+                    let vectors: [[Float]]
+                    let tokens: Int
+                    if embeddingBackend == .mlx {
+                        let runtime = try await MLXModelRuntime.load(
+                            directory: URL(fileURLWithPath: emb), kind: .embedding, task: taskFlag)
+                        (vectors, tokens) = try await runtime.embed(
+                            texts: texts, maxLength: maxLength)
+                    } else {
+                        // ONNX / CoreML：加载后注入 swift-transformers 分词器
+                        let runtime: any ModelRuntime
+                        if embeddingBackend == .onnx {
+                            let env = try ORTEnv(loggingLevel: .warning)
+                            let resolved = try ModelPathResolver.resolve(emb)
+                            runtime = try ORTEngine.load(
+                                url: resolved.modelURL, kind: .embedding, env: env,
+                                coreML: CoreMLOptions(
+                                    enabled: !arguments.contains("--no-coreml") && !cpuOnly,
+                                    cpuOnly: cpuOnly),
+                                task: taskFlag)
+                            let tok = try await TokenizerService.load(
+                                fromDirectory: resolved.modelURL.deletingLastPathComponent())
+                            (runtime as? ORTModelRuntime)?.tokenizer = tok
+                        } else {
+                            runtime = try CoreMLModelRuntime.load(
+                                url: URL(fileURLWithPath: emb).standardizedFileURL,
+                                kind: .embedding, cpuOnly: cpuOnly)
+                            let tok = try await TokenizerService.load(
+                                fromDirectory: URL(fileURLWithPath: emb).deletingLastPathComponent())
+                            (runtime as? CoreMLModelRuntime)?.tokenizer = tok
+                        }
+                        (vectors, tokens) = try await runtime.embed(
+                            texts: texts, maxLength: maxLength)
+                    }
                     let out: [String: Any] = [
                         "vectors": vectors,
                         "tokens": tokens,
@@ -84,7 +117,7 @@ enum CLI {
         )
 
         let requests: [ModelLoadRequest?] = [
-            embeddingPath.isEmpty ? nil : ModelLoadRequest(path: embeddingPath, backend: embeddingBackend, kind: .embedding),
+            embeddingPath.isEmpty ? nil : ModelLoadRequest(path: embeddingPath, backend: embeddingBackend, kind: .embedding, task: taskFlag),
             rerankerPath.isEmpty ? nil : ModelLoadRequest(path: rerankerPath, backend: rerankerBackend, kind: .reranker),
         ]
 
@@ -128,7 +161,8 @@ enum CLI {
         用法：
           ONNXRuntimeTester --embedding <模型路径> [--embedding-backend onnx|mlx|coreml] \\
               [--reranker <模型路径>] [--reranker-backend onnx|mlx|coreml] \\
-              [--batch 16] [--count 128] [--max-length 128] [--no-coreml] [--cpu-only]
+              [--batch 16] [--count 128] [--max-length 128] [--no-coreml] [--cpu-only] \\
+              [--task retrieval.passage]（仅 jina-embeddings-v3 生效）
 
         后端说明：
           onnx    ONNX Runtime 加载 .onnx（默认）

@@ -6,6 +6,9 @@ struct ModelLoadRequest {
     var path: String
     var backend: BackendKind
     var kind: ModelKind
+    /// 仅对 jina-embeddings-v3 生效：指定 LoRA 任务分支
+    /// （retrieval.query / retrieval.passage / separation / classification / text-matching），默认 retrieval.passage
+    var task: String? = nil
 }
 
 /// 基准测试参数
@@ -99,7 +102,8 @@ actor BenchmarkEngine {
             let resolved = try ModelPathResolver.resolve(req.path)
             addUnique(resolved.modelURL.deletingLastPathComponent(), to: &tokenizerCandidates)
             addUnique(resolved.modelURL.deletingLastPathComponent().deletingLastPathComponent(), to: &tokenizerCandidates)
-            let runtime = try ORTEngine.load(url: resolved.modelURL, kind: kind, env: env, coreML: coreML)
+            let runtime = try ORTEngine.load(
+                url: resolved.modelURL, kind: kind, env: env, coreML: coreML, task: req.task)
             return (runtime, resolved.modelURL.path)
         case .coreml:
             let url = URL(fileURLWithPath: req.path).standardizedFileURL
@@ -114,7 +118,7 @@ actor BenchmarkEngine {
                 throw MLXRuntimeError.loadFailed("路径不存在：\(req.path)")
             }
             let dir = isDir.boolValue ? url : url.deletingLastPathComponent()
-            let runtime = try await MLXModelRuntime.load(directory: dir, kind: kind)
+            let runtime = try await MLXModelRuntime.load(directory: dir, kind: kind, task: req.task)
             return (runtime, dir.path)
         }
     }

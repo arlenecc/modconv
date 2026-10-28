@@ -11,6 +11,40 @@ func coreMLCompatibilityHint(_ message: String) -> String {
     return "\n（该模型与 CoreML 执行提供程序不兼容：可在界面取消勾选「ONNX 启用 CoreML EP」或勾选「仅使用 CPU」后重试）"
 }
 
+/// jina-embeddings-v3 的 ONNX 是「统一任务」模型：需把任务前缀拼到文本前，并额外传入
+/// 标量输入 task_id（retrieval.query=0 / retrieval.passage=1 / separation=2 /
+/// classification=3 / text-matching=4）。输出 sentence_embedding 已是均值池化 + L2。
+struct JinaV3TaskInfo {
+    let taskId: Int
+    let prompt: String
+}
+
+/// 从模型目录 config.json 的 task_id_map（无则用默认映射）与官方任务前缀构造 jina-v3 任务信息。
+/// 官方 v3 任务前缀（config 未保存前缀，此处硬编码）：
+private func jinaV3TaskInfo(directory: URL, task: String?) -> JinaV3TaskInfo {
+    let prompts: [String: String] = [
+        "retrieval.query": "Represent the query for retrieving evidence documents: ",
+        "retrieval.passage": "Represent the document for retrieval: ",
+        "separation": "Represent the sentence for semantic textual similarity: ",
+        "classification": "Represent the document for classification: ",
+        "text-matching": "Represent the sentence for semantic textual similarity: ",
+    ]
+    var idMap: [String: Int] = [
+        "retrieval.query": 0, "retrieval.passage": 1, "separation": 2,
+        "classification": 3, "text-matching": 4,
+    ]
+    if let cfg = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+        let obj = try? JSONSerialization.jsonObject(with: cfg) as? [String: Any],
+        let map = obj["task_id_map"] as? [String: Int]
+    {
+        idMap = map
+    }
+    let taskKey = (task ?? "retrieval.passage").lowercased()
+    let id = idMap[taskKey] ?? 1
+    let prompt = prompts[taskKey] ?? prompts["retrieval.passage"]!
+    return JinaV3TaskInfo(taskId: id, prompt: prompt)
+}
+
 enum ORTEngineError: LocalizedError {
     case envCreationFailed(String)
     case sessionCreationFailed(String)
@@ -105,6 +139,8 @@ final class ORTModelRuntime: @unchecked Sendable {
 
     /// 分词器（由引擎在加载后注入；ONNX 与 CoreML 共用 swift-transformers 分词器）
     var tokenizer: (any TextTokenizer)?
+    /// jina-embeddings-v3 专用：统一任务模型的任务前缀与 task_id（仅对带 task_id 输入的模型设置）
+    var jinaV3: JinaV3TaskInfo?
     /// 首次 embedding 推理后缓存的向量维度
     private var cachedDimension: Int = 0
 
@@ -147,11 +183,13 @@ final class ORTModelRuntime: @unchecked Sendable {
 
     // MARK: - 输入张量构建
 
-    /// 按模型声明的输入名匹配 id / mask / type_ids 并打包为 ORTValue
+    /// 按模型声明的输入名匹配 id / mask / type_ids 并打包为 ORTValue。
+    /// taskId 非 nil 时（jina-embeddings-v3）额外构造标量 task_id 输入。
     func buildInputs(
         ids: [[Int]],
         attentionMasks: [[Int]],
-        tokenTypeIds: [[Int]]
+        tokenTypeIds: [[Int]],
+        taskId: Int? = nil
     ) throws -> [String: ORTValue] {
         var inputs: [String: ORTValue] = [:]
         var matchedIds = false
@@ -170,6 +208,12 @@ final class ORTModelRuntime: @unchecked Sendable {
             }
         }
 
+        if let tid = taskId,
+            let name = inputNames.first(where: { $0.lowercased() == "task_id" })
+        {
+            inputs[name] = try makeScalarTensor(Int64(tid))
+        }
+
         guard matchedIds else {
             throw ORTEngineError.missingInput(inputNames.joined(separator: ", "))
         }
@@ -177,6 +221,12 @@ final class ORTModelRuntime: @unchecked Sendable {
             throw ORTEngineError.missingInput("attention_mask")
         }
         return inputs
+    }
+
+    /// 构造标量 int64 张量（如 jina-v3 的 task_id 输入）
+    private func makeScalarTensor(_ value: Int64) throws -> ORTValue {
+        let data = NSMutableData(bytes: [value], length: MemoryLayout<Int64>.size)
+        return try ORTValue(tensorData: data, elementType: .int64, shape: [])
     }
 
     private func makeTensor(_ rows: [[Int]]) throws -> ORTValue {
@@ -223,10 +273,12 @@ final class ORTModelRuntime: @unchecked Sendable {
     func runBatch(
         ids: [[Int]],
         attentionMasks: [[Int]],
-        tokenTypeIds: [[Int]]
+        tokenTypeIds: [[Int]],
+        taskId: Int? = nil
     ) throws -> [String: ORTValue] {
         do {
-            let inputs = try buildInputs(ids: ids, attentionMasks: attentionMasks, tokenTypeIds: tokenTypeIds)
+            let inputs = try buildInputs(
+                ids: ids, attentionMasks: attentionMasks, tokenTypeIds: tokenTypeIds, taskId: taskId)
             return try session.run(
                 withInputs: inputs,
                 outputNames: Set(outputNames),
@@ -238,8 +290,8 @@ final class ORTModelRuntime: @unchecked Sendable {
                 elementType = .int32
                 do {
                     let inputs = try buildInputs(
-                        ids: ids, attentionMasks: attentionMasks, tokenTypeIds: tokenTypeIds
-                    )
+                        ids: ids, attentionMasks: attentionMasks, tokenTypeIds: tokenTypeIds,
+                        taskId: taskId)
                     return try session.run(
                         withInputs: inputs,
                         outputNames: Set(outputNames),
@@ -408,7 +460,8 @@ enum ORTEngine {
         url: URL,
         kind: ModelKind,
         env: ORTEnv,
-        coreML: CoreMLOptions
+        coreML: CoreMLOptions,
+        task: String? = nil
     ) throws -> ORTModelRuntime {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: url.path) else {
@@ -482,6 +535,10 @@ enum ORTEngine {
             loadDuration: loadDuration,
             fileBytes: fileBytes
         )
+        // jina-embeddings-v3：模型含独立的 task_id 输入，需按任务前缀 + task_id 推理
+        if inputNames.contains(where: { $0.lowercased() == "task_id" }) {
+            runtime.jinaV3 = jinaV3TaskInfo(directory: url.deletingLastPathComponent(), task: task)
+        }
         return runtime
     }
 }
@@ -522,9 +579,11 @@ extension ORTModelRuntime: ModelRuntime {
         guard let tokenizer else {
             throw ORTEngineError.sessionCreationFailed("分词器未加载，无法构造输入")
         }
-        let encoded = texts.map { tokenizer.encode($0, maxLength: maxLength) }
+        // jina-embeddings-v3：拼上任务前缀后再分词（retrieval.passage 等）
+        let processed = jinaV3.map { info in texts.map { info.prompt + $0 } } ?? texts
+        let encoded = processed.map { tokenizer.encode($0, maxLength: maxLength) }
         let (ids, masks, types) = padBatch(encoded)
-        let outputs = try runBatch(ids: ids, attentionMasks: masks, tokenTypeIds: types)
+        let outputs = try runBatch(ids: ids, attentionMasks: masks, tokenTypeIds: types, taskId: jinaV3?.taskId)
         let (floats, shape) = try readFirstOutput(outputs)
         let vectors = poolEmbeddingOutput(floats, shape: shape, masks: masks)
         if let first = vectors.first { cachedDimension = first.count }
